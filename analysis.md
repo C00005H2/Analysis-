@@ -1,1503 +1,878 @@
-# `Test2.exe` — Reverse-Engineering Analysis
+# Test2.exe — Comprehensive Reverse-Engineering Report
 
-**Target:** `Test2.exe` (32,868,040 bytes)
-**Analysis date:** 2025-09-30
-**Analysis type:** Static. No Windows execution environment was available, so every runtime claim below is derived from recovered code/data and is labelled accordingly.
-**Tooling:** `pefile`, `capstone`, `openssl`, and a purpose-written aPLib depacker (`tools/aplib_unpack.c`) built during this analysis.
+| Field | Value |
+|---|---|
+| **Subject** | `Test2.exe` (working copy in repository root) |
+| **SHA-256** | `1fe62f8ea1879b34d5cc711a8999e878e3394896dbd761d8bd95b8d8c51f0e27` |
+| **MD5** | `e29e999cd9f5dcbe189fe938ecc84c89` |
+| **Size** | 32,868,040 bytes (0x1F586C8) |
+| **Analysis date** | 2026-09-30 |
+| **Analysis environment** | Debian 12 (bookworm) x86-64 Linux sandbox — **static analysis + offline unpacking only; the sample was never executed** (no Windows runtime available) |
+| **Tooling** | GNU `objdump`/`readelf`/`strings` (binutils), Python 3.11 with `pefile` 2024.8.26, `capstone` 5.0.9, `aplib` 0.6, OpenSSL 3.0 (PKCS#7), custom PE/`aPLib` parsers written during analysis |
 
 ---
 
-## Table of Contents
+## 0. How to read this report
 
-1. [Executive Summary](#1-executive-summary)
-2. [File and Binary Identification](#2-file-and-binary-identification)
-3. [Architecture](#3-architecture)
-4. [Dependencies and External Interfaces](#4-dependencies-and-external-interfaces)
-5. [Entry Point](#5-entry-point)
-6. [Complete Initialization Flow](#6-complete-initialization-flow)
-7. [Initialization Sequence Diagram / Flow](#7-initialization-sequence-diagram--flow)
-8. [Major Components](#8-major-components)
-9. [Functions and Important Symbols](#9-functions-and-important-symbols)
-10. [Data Structures](#10-data-structures)
-11. [Runtime State and Control Flow](#11-runtime-state-and-control-flow)
-12. [Feature-by-Feature Analysis](#12-feature-by-feature-analysis)
-13. [Detailed Program Logic](#13-detailed-program-logic)
-14. [Filesystem Behavior](#14-filesystem-behavior)
-15. [Registry / System Interaction](#15-registry--system-interaction)
-16. [Process and Thread Behavior](#16-process-and-thread-behavior)
-17. [Network / IPC Behavior](#17-network--ipc-behavior)
-18. [Configuration](#18-configuration)
-19. [Resources](#19-resources)
-20. [Error Handling](#20-error-handling)
-21. [Security-Relevant Behavior](#21-security-relevant-behavior)
-22. [Reverse-Engineering Evidence](#22-reverse-engineering-evidence)
-23. [Confirmed vs Inferred Findings](#23-confirmed-vs-inferred-findings)
-24. [Unknowns and Limitations](#24-unknowns-and-limitations)
-25. [Reconstructed Execution Flow](#25-reconstructed-execution-flow)
-26. [Overall Technical Architecture](#26-overall-technical-architecture)
-27. [Appendix A — Reproducing This Analysis](#appendix-a--reproducing-this-analysis)
-28. [Appendix B — Complete Recovered String Inventory](#appendix-b--complete-recovered-string-inventory)
+Every significant claim is labeled with a confidence level:
+
+* **[CONFIRMED]** — directly established from bytes/disassembly/structure in the file itself, or cryptographically verified.
+* **[STRONGLY INFERRED]** — the mechanism follows from confirmed evidence plus well-established knowledge of the identified protection system, but the exact code path was not executed.
+* **[INFERRED]** — plausible reconstruction from indirect evidence.
+* **[UNCERTAIN]** — could not be established; hypotheses are given where useful.
+
+Addresses are given as **VA** (virtual address, ImageBase 0x400000 + RVA) and, where relevant, as file offsets. The entry point and all bootstrap code discussed in §5–§8 were disassembled and are reproduced with annotations.
+
+**Follow-ups:** a second, deeper static pass over the unpacked kernel is documented in **§27 (Deeper Static Analysis — Round 2)** — it resolved the `.vm_sec` structure, the kernel's crypto inventory, the WinLicense licensing strings, embedded command-line switches, and a second VM interpreter level. A third pass (**§28 — VM Handler Taxonomy and Cipher Structure**) then classified all 685 VM handlers and established the ARX (no-S-box) cipher structure. A fourth pass (**§29 — Dynamic Emulation**) executed the kernel under Unicorn, reversed its manual export-resolution engine and hash completely, recovered the full runtime API set, and drove execution 320 million instructions into initialization.
 
 ---
 
 ## 1. Executive Summary
 
-`Test2.exe` is a **32-bit native Windows GUI executable protected with Themida / WinLicense 3.2.4.52 (Oreans Technologies' "SecureEngine")**. It is **not** malware-obfuscated in an ad-hoc way and it is **not** a .NET/managed assembly; it is a commercial, code-signed, packed native binary.
+`Test2.exe` is a **32-bit native Windows GUI application that has been protected with the Oreans Technologies *SecureEngine* packer/protector — the Themida/WinLicense family, version 3.2.4.52**. This is established by the file's own version resource ("Themida – Advanced Windows Software Protection", 3.2.4.52, Oreans Technologies), the characteristic section layout (`.winlice`, `.boot`, `.vm_sec`, huge unnamed encrypted sections), an embedded SecureEngine PDB path recovered after unpacking, and the packer's signature multi-stage startup behavior which was fully reversed. **[CONFIRMED]**
 
-The file has a two-layer structure:
+Key findings:
 
-* **Outer layer (protector).** A ~1.5 KB entry stub (`.text`), an import "DLL-preload" table (`.idata`), a 21.5 MB aPLib-compressed blob (`.boot`), a 28.3 MB zero-filled RWX runtime arena (`.winlice`), and a small branch-fixup table (`.vm_sec`).
-* **Inner layer (payload).** The original application's 11 sections, left at their original RVAs but with their **section names wiped and their contents encrypted** (entropy 7.89–7.99).
+1. **Not .NET, not UPX-style packed, not a generic crypter.** It is a custom commercial protector: a small plaintext bootstrap stub decrypts a ~22.5 MB `aPLib`-compressed stream into a 29.7 MB in-memory kernel image (`.winlice`) that is a **code-virtualization engine** (bytecode VM with encrypted handler dispatch). **[CONFIRMED — unpacking reproduced offline]**
+2. **The complete stage-0 and stage-1 startup was reconstructed and is documented below with annotated disassembly**, including the entry-point anti-analysis "warm-up" loops (≈39,000 `GetModuleHandleA`, ≈20,700 `VirtualAlloc`/`VirtualFree`, ≈6,100 `LoadLibraryA`/`FreeLibrary` calls), the return-address trampoline into the boot kernel, the `aPLib` block decompressor, and the hand-off into the VM kernel at VA `0x2FA44B4`. **[CONFIRMED]**
+3. **Two complete embedded PE images were recovered from the unpacked kernel**: an Oreans helper DLL (`XBundlerTlsHelper`, with PDB path `Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb`) and a small 2007-vintage "process-restart" utility EXE whose full logic (parse quoted command line → kill PID → sleep → `CreateProcessA` respawn) was recovered. **[CONFIRMED]**
+4. **The original (pre-protection) program is encrypted** inside two large unnamed sections (~16.7 MB virtual, ~5.9 MB on disk, entropy ≈ 7.98). It identified itself as **"Themida.exe" 3.2.4.52** (version resource, export-table internal name, Delphi/madExcept artifacts such as `madTraceProcess`, `__dbk_fcall_wrapper`, and the Delphi-default `MAINICON` resource). **[CONFIRMED identifiers; original code content NOT recoverable statically]**
+5. **The file carries a valid Authenticode signature.** The embedded SHA-256 Authenticode digest was independently recomputed and **matches** the file exactly; the signing chain terminates at an individual code-signing certificate (Certum, "Rafael Patricio Ahucha Ruiz", ES), countersigned by Certum Timestamp 2025 at **2025-10-10 09:25:29 UTC** — one minute after the PE link timestamp. **[CONFIRMED cryptographically]**
+6. **No malicious payloads, URLs, or network indicators were found** in the recoverable plaintext. The only URLs in the file belong to the certificate chain (Certum CRL/OCSP endpoints). The *sibling file in this repository*, `test.exe`, is a separate, unrelated sample (an x64 game-cheat injector for `tf_win64.exe`); it is **not** embedded in `Test2.exe` (byte-level search negative) and is covered in Appendix A. **[CONFIRMED]**
 
-The single most productive result of this analysis is that **the protector's first decompression stage was fully recovered and re-implemented**. The entry stub reaches `.boot+0x58` through a *fake return address*; `.boot+0x5D` contains a textbook **aPLib** depacker in plain, un-obfuscated x86. Re-implementing it (`tools/aplib_unpack.c`) decompresses 32 back-to-back streams into exactly **0x1C52000 bytes — bit-for-bit the declared virtual size of `.winlice`** — confirming the reconstruction is exact.
+The bulk of the program's actual business logic — both the SecureEngine kernel's VM bytecode and the original application's code — is encrypted or virtualized and could not be recovered without dynamic execution; §24 lists exactly what remains unknown and why.
 
-From that recovered 28.3 MB image the analysis extracted:
+**Round-2 additions (§27):** a deeper pass over the unpacked kernel identified the protection engine's internal build (`Themida64_GUI`, built 2025-10-10), the intact **WinLicense licensing subsystem** (registry keys `Software\WinLicense`, `Software\MyCompany\MyProduct`, `Software\WLkt`; license files `TMLicenseA1.dat`, `extendkey.dat`), seven embedded command-line switches (`/nosplash`, `/dumpstatus`, `/checkprotection`, …), proved `.vm_sec` is a **registry of 685 jump-bridge slot pairs** (all verified `E9 jmp rel32`), confirmed a **custom crypto layer** (standard CRC32 table + golden-ratio/TEA-style `0x9E3779B9` mixing; **no** AES/SHA/MD5 constants anywhere), census-validated **76 `rdtsc` / 78 `cpuid` / 63 `int 2d`** anti-analysis instructions, and closed the overlay question (no hidden data after the certificate).
 
-* the **SecureEngine runtime string pool** (registry keys, licence filenames, 16 command-line switches, the bug-check/diagnostic report template),
-* **two complete embedded PE files** — `XBundlerTlsHelper.dll` (with its original Oreans PDB path) and a small **process terminate-and-relaunch stub**, which was reverse-engineered in full,
-* a **437-entry branch-trampoline fixup table** in `.vm_sec`, every entry verified to point at a 5-byte `E9 jmp rel32`.
+**Round-3 additions (§28):** all **685 VM handlers** reachable via `.vm_sec` were classified into archetypes (rolling-key opcode decrypt in ~380, dispatch-table references in 127, EFLAGS integration in 210), including a **dedicated `rdtsc` VM instruction** (VA 0x1CB9F1F) and **four native-call VM instructions** into shared kernel helpers — and a full-image S-box scan proved the cipher layer is **ARX-style with zero substitution tables**.
 
-**Identity.** The payload is, with high confidence, **Oreans' own `Themida.exe` version 3.2.4.52 protected with itself**:
-
-| Evidence | Value |
-|---|---|
-| `RT_VERSION` | `Oreans Technologies` / `Themida - Advanced Windows Software Protection` / `3.2.4.52` |
-| Export directory module name | `Themida.exe` (a byte-exact copy of the original `.edata`, size `0xB3`) |
-| Authenticode signer | `Rafael Patricio Ahucha Ruiz`, Jerez de la Frontera, Cádiz, ES |
-| Authenticode digest | **Verified — matches the signature exactly** (file unmodified since signing) |
-| Signing time | 2025-10-10 09:25:29 UTC |
-| Protection project name | `Themida64_GUI` (UTF-16, adjacent to `WLProjectName`) |
-| Compiler exports | `__dbk_fcall_wrapper`, `dbkFCallWrapperAddr`, `TMethodImplementationIntercept` → Delphi/RAD Studio |
-| Third-party export | `madTraceProcess` → **madExcept** exception-reporting library |
-
-Rafael Ahucha is the registrant of oreans.com [1](https://website.informer.com/Rafael+Ahucha+Oreans+Technologies.html), and Themida being a Delphi application is corroborated by the vendor's own PAD listing and community reports [2](https://www.oreans.com/ThemidaPad.xml) [3](https://stackoverflow.com/questions/2290324/tool-for-licensing-and-protect-my-delphi-win32-apps). The three Delphi exports are the well-documented default exports of every RAD Studio binary [4](https://en.delphipraxis.net/topic/330-how-to-remove-default-dll-exports-delphi-rio/).
-
-**What could not be recovered:** the payload's own code. The original `.text` (16.0 MB), `.rsrc` (6.8 MB) and the remaining nine sections are encrypted with a key that is derived at runtime inside heavily mutated SecureEngine code. Nothing about the application's *own* features, UI, algorithms or logic can be established from this file alone. Section [24](#24-unknowns-and-limitations) enumerates this precisely.
+**Round-4 additions (§29 — dynamic emulation):** the unpacked kernel was **executed under a Unicorn x86 emulator** with a synthetic Windows environment (fake PEB/TEB and PE modules). This reversed the kernel's **manual export-resolution engine** completely — it walks module export tables itself (first-char prefilter at 0x1CA817A → `scasb` strlen at 0x1CAAC8D → a CRC-16-style rolling hash with polynomial 0x5041 over the name *including* its NUL → compare at 0x2F8FC65) — and the hash was **reproduced offline with 124/124 validation**, turning failed resolutions into solvable brute-forces (e.g. it recovers `IsWow64Process2`, proving the engine probes Windows 10 APIs). **152 unique runtime-resolved APIs** were observed (registry, Toolhelp32 process scanning, SID/ACL and token checks, message pump, file mapping), and execution reached **320 million instructions** — through 106 `VirtualProtect` calls, administrator/token checks, and a `LoadLibraryA("SETUPAPI.DLL")` attempt — before the current emulation frontier. The original code sections remain encrypted at that frontier (0 dirty pages); OEP has not yet been reached.
 
 ---
 
 ## 2. File and Binary Identification
 
-### 2.1 Hashes and size — **confirmed**
+### 2.1 Core identification **[CONFIRMED]**
 
-| Field | Value |
+| Property | Value |
 |---|---|
-| File name | `Test2.exe` |
-| Size | 32,868,040 bytes (`0x1F586C8`) |
-| MD5 | `e29e999cd9f5dcbe189fe938ecc84c89` |
-| SHA-1 | `ec356769c3fefb63b05e230a78d5e72173c898c3` |
-| SHA-256 | `1fe62f8ea1879b34d5cc711a8999e878e3394896dbd761d8bd95b8d8c51f0e27` |
-| Authenticode SHA-256 | `27ce79462c82d368da3cfa079e2bc38bf366c703f23cefb4dce2e0eb4b730797` |
+| Format | PE32 (Portable Executable, 32-bit), magic `0x10B` |
+| Machine | `0x014C` (Intel i386) |
+| Subsystem | 2 — Windows GUI |
+| ImageBase | 0x00400000 |
+| AddressOfEntryPoint | RVA 0x04A7D000 → **VA 0x4E7D000** (file offset 0x1F55800, start of `.text`) |
+| SizeOfImage | 0x04A7F000 (≈ 74.9 MB of virtual address space) |
+| SizeOfHeaders | 0x600; FileAlignment 0x200; SectionAlignment 0x1000 |
+| TimeDateStamp | 1760088269 = **2025-10-10 09:24:29 UTC** |
+| Linker version | 2.25 (atypical — MSVC linkers are 14.x, Delphi/legacy are ≤ 6; value is plausibly falsified or produced by the protector's header rewriting) |
+| CheckSum | 0x01F5D153 (non-zero, consistent with a signed image) |
+| OS version fields | 5.0 / 5.0 (claims Windows 2000 compatibility) |
+| DllCharacteristics | **0x0000** — no `DYNAMIC_BASE`, no `NX_COMPAT`, no `SEH`-related flags (ASLR/DEP opt-in flags are absent even though a `.reloc` directory exists) |
+| Characteristics | 0x81AE — executable, symbols stripped, line numbers stripped, **large address aware**, 32-bit words |
+| Debug directory | **absent** (stripped) |
+| CLR (COM descriptor) | **absent** — native code, not managed |
+| Overlay | **none** — the file ends exactly at the end of the appended certificate table (0x1F55E58 + 0x2870 = 0x1F586C8 = file size) |
 
-> Throughout this report **KB/MB mean KiB/MiB** (1 MB = 1,048,576 bytes), matching the values shown by PE tooling. Exact byte and hex figures are given in the tables wherever precision matters.
+### 2.2 Section table **[CONFIRMED]**
 
-### 2.2 Headers — **confirmed**
+21 sections. Most have **blank names** (8 spaces) — itself a packer hallmark. Entropy over raw data.
 
-The DOS header begins `4D 5A 50` — **`MZP`**, not the usual `MZ\x90`. The stub text is `This program must be run under Win32`. Both are the signature of the **Borland / Embarcadero `ILINK32`** linker family (Delphi, C++Builder).
-
-```
-00000000  4d 5a 50 00 02 00 00 00  04 00 0f 00 ff ff 00 00   MZP.............
-00000050  54 68 69 73 20 70 72 6f  67 72 61 6d 20 6d 75 73   This program mus
-00000060  74 20 62 65 20 72 75 6e  20 75 6e 64 65 72 20 57   t be run under W
-00000070  69 6e 33 32 0d 0a 24 37                            in32..$7
-```
-
-| COFF / Optional header field | Value | Note |
-|---|---|---|
-| `e_lfanew` | `0x100` | |
-| `Machine` | `0x014C` | IMAGE_FILE_MACHINE_I386 — **32-bit x86, native** |
-| `NumberOfSections` | **21** | unusually high; protector added 10 |
-| `TimeDateStamp` | `0x68E8D0CD` | **2025-10-10 09:24:29 UTC** |
-| `Characteristics` | `0x81AE` | EXECUTABLE_IMAGE, LINE_NUMS_STRIPPED, LOCAL_SYMS_STRIPPED, **LARGE_ADDRESS_AWARE**, BYTES_REVERSED_LO/HI, 32BIT_MACHINE |
-| `Magic` | `0x010B` | PE32 |
-| Linker version | 2.25 | Embarcadero `ILINK32` |
-| `AddressOfEntryPoint` | `0x04A7D000` | in the **last** `.text` section (protector stub) |
-| `BaseOfCode` | `0x00001000` | original payload code base |
-| `ImageBase` | `0x00400000` | |
-| `SectionAlignment` / `FileAlignment` | `0x1000` / `0x200` | |
-| `SizeOfImage` | `0x04A7F000` (≈74.5 MB virtual) | |
-| `SizeOfHeaders` | `0x600` | |
-| `CheckSum` | `0x01F5D153` | **valid** (recomputes identically) |
-| `Subsystem` | 2 | IMAGE_SUBSYSTEM_WINDOWS_GUI |
-| `MajorSubsystemVersion` | 5.0 | Windows 2000+ |
-| `DllCharacteristics` | **`0x0000`** | **no ASLR, no DEP/NX, no SEH hardening, no CFG** |
-| Stack reserve / commit | `0x100000` / `0x4000` | Delphi defaults |
-| Heap reserve / commit | `0x100000` / `0x1000` | |
-
-> **Security note (confirmed).** `DllCharacteristics == 0` means `IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE`, `NX_COMPAT`, and `NO_SEH` are all clear. The image therefore loads at its preferred base `0x00400000` with ASLR and DEP opt-out. This is *required* by the design: the protector hard-codes absolute addresses (e.g. `mov eax, 0x38F9058`) and executes code from a writable section.
-
-### 2.3 Data directories — **confirmed**
-
-| Directory | RVA | Size | Resides in |
-|---|---|---|---|
-| EXPORT | `0x01890000` | `0x0000_00B3` | `.edata` (protector-rebuilt) |
-| IMPORT | `0x01899329` | `0x0000_027C` | `.idata` (protector-built) |
-| RESOURCE | `0x0189B000` | `0x0000_BFF4` | `.rsrc` (protector-built) |
-| SECURITY | `0x01F55E58` (file offset) | `0x0000_2870` | overlay / Authenticode blob |
-| BASERELOC | `0x04A7E000` | `0x0000_0054` | `.reloc` (protector-built) |
-| TLS | `0x0189A668` | `0x0000_0018` | `.tls` (second, protector-built) |
-| DELAY_IMPORT | `0x0103C000` | `0x0000_0B34` | **original, now-encrypted `.didata`** |
-
-The **DELAY_IMPORT directory still points at the original payload section** (section 5, RVA `0x0103C000`, virtual size `0xB34` — an exact match). That data is encrypted on disk, so the directory is unparseable. This is strong evidence that the original program used Delphi's delay-loaded imports (`.didata`) and that the protector only *redirected* the import/export/resource directories, leaving the delay-import pointer stale. — **confirmed** (structural), **strongly inferred** (interpretation).
-
-### 2.4 Section table — **confirmed**
-
-21 sections. Entropy computed over raw data.
-
-| # | Name | VA (RVA) | VSize | RawPtr | RawSize | Entropy | Flags | Role |
+| # | Name | RVA | VSize | RawOff | RawSize | Flags | Entropy | Role |
 |---|---|---|---|---|---|---|---|---|
-| 0 | *(wiped)* | `00001000` | `00FFBFD4` | `00000600` | `005A4200` | **7.985** | CODE r-x | payload `.text` (16.0 MB) — encrypted |
-| 1 | *(wiped)* | `00FFD000` | `0000916C` | `005A4800` | `00004E00` | **7.889** | CODE r-x | payload `.itext` — encrypted |
-| 2 | *(wiped)* | `01007000` | `00024314` | `005A9600` | `00015C00` | **7.928** | IDATA rw- | payload `.data` — encrypted |
-| 3 | `.bss` | `0102C000` | `00009F5C` | — | 0 | — | rw- | payload `.bss` (**name survives**) |
-| 4 | *(wiped)* | `01036000` | `00005B78` | `005BF200` | `00000800` | 6.893 | IDATA rw- | payload `.idata` — encrypted |
-| 5 | *(wiped)* | `0103C000` | `00000B34` | `005BFA00` | `00000400` | 7.731 | IDATA rw- | payload `.didata` — encrypted |
-| 6 | *(wiped)* | `0103D000` | `000000B3` | `005BFE00` | `00000200` | 2.733 | IDATA r-- | payload `.edata` — encrypted |
-| 7 | `.tls` | `0103E000` | `00000654` | — | 0 | — | rw- | payload `.tls` (**name survives**) |
-| 8 | *(wiped)* | `0103F000` | `0000005D` | `005C0000` | `00000200` | 1.776 | IDATA r-- | payload `.rdata` — encrypted |
-| 9 | *(wiped)* | `01040000` | `001820C0` | `005C0200` | `000D7E00` | **7.973** | IDATA r-- | payload `.reloc` (1.5 MB) — encrypted |
-| 10 | *(wiped)* | `011C3000` | `006CC4E8` | `00698000` | `00325800` | **7.960** | IDATA r-- | payload `.rsrc` (6.8 MB) — encrypted |
-| 11 | `.edata` | `01890000` | `00001000` | `009BD800` | `00000200` | 2.201 | IDATA r-- | **protector**: rebuilt export dir |
-| 12 | `.vm_sec` | `01891000` | `00008000` | `009BDA00` | `00008000` | 4.992 | IDATA rw- | **protector**: branch-fixup table |
-| 13 | `.idata` | `01899000` | `00001000` | `009C5A00` | `00000600` | 4.430 | IDATA rw- | **protector**: DLL-preload imports |
-| 14 | `.tls` | `0189A000` | `00001000` | `009C6000` | `00000800` | 0.061 | rw- | **protector**: relocated TLS dir |
-| 15 | `.rsrc` | `0189B000` | `0000C000` | `009C6800` | `0000C000` | 7.080 | IDATA r-- | **protector**: loader-visible resources |
-| 16 | **`.winlice`** | `018A7000` | **`01C52000`** | — | **0** | — | **rwx CODE** | **protector**: 28.3 MB RWX runtime arena |
-| 17 | **`.boot`** | `034F9000` | `01582C00` | `009D2800` | `01582C00` | 7.885 | CODE r-x | **protector**: aPLib-packed engine (21.5 MB) |
-| 18 | `.data` | `04A7C000` | `00000400` | `01F55400` | `00000400` | 3.278 | IDATA rw- | **protector**: stub data (`skeleton.dll`) |
-| 19 | `.text` | `04A7D000` | `00000600` | `01F55800` | `00000600` | 2.681 | CODE r-x | **protector**: entry stub (EP here) |
-| 20 | `.reloc` | `04A7E000` | `00001000` | `01F55E00` | `00000054` | 4.585 | r-- | **protector**: 34 relocations only |
+| 0 | *(blank)* | 0x001000 | 0xFFBFD4 | 0x000600 | 0x5A4200 | R+X code | 7.98 | **Encrypted original program (part 1)** |
+| 1 | *(blank)* | 0xFFD000 | 0x00916C | 0x5A4800 | 0x004E00 | R+X code | 7.89 | Encrypted original program (part 2) |
+| 2 | *(blank)* | 0x1007000 | 0x024314 | 0x5A9600 | 0x015C00 | RW data | 7.93 | Encrypted data |
+| 3 | `.bss` | 0x102C000 | 0x009F5C | — | 0 | RW | — | Uninitialized data |
+| 4 | *(blank)* | 0x1036000 | 0x005B78 | 0x5BF200 | 0x000800 | RW | 6.89 | Encrypted data |
+| 5 | *(blank)* | 0x103C000 | 0x000B34 | 0x5BFA00 | 0x000400 | RW | 7.73 | Encrypted blob occupying the **fake delay-import directory** (§18) |
+| 6 | *(blank)* | 0x103D000 | 0x0000B3 | 0x5BFE00 | 0x000200 | R | 2.73* | Small encrypted blob (0x90 bytes of pseudo-random data + zeros); same size (0xB3) as the export directory — possibly the original, now-encrypted export directory (§22) **[UNCERTAIN]** |
+| 7 | `.tls` | 0x103E000 | 0x000654 | — | 0 | RW | — | TLS template (raw-less) |
+| 8 | *(blank)* | 0x103F000 | 0x00005D | 0x5C0000 | 0x000200 | R | 1.78 | Small data block |
+| 9 | *(blank)* | 0x1040000 | 0x1820C0 | 0x5C0200 | 0x0D7E00 | R | 7.97 | Encrypted data |
+| 10 | *(blank)* | 0x11C3000 | 0x6CC4E8 | 0x698000 | 0x325800 | R | 7.96 | Encrypted data — **target region of the `.vm_sec` pointer table** (§8.6) |
+| 11 | `.edata` | 0x1890000 | 0x001000 | 0x9BD800 | 0x000200 | R | 2.20 | Export directory (plaintext copy) |
+| 12 | `.vm_sec` | 0x1891000 | 0x008000 | 0x9BDA00 | 0x008000 | RW | 4.99 | **Array of RVA pointer pairs into `.winlice`** — VM handler/patch registry (§8.6) |
+| 13 | `.idata` | 0x1899000 | 0x001000 | 0x9C5A00 | 0x000600 | RW | 4.43 | Import tables (minimal IAT) |
+| 14 | `.tls` | 0x189A000 | 0x001000 | 0x9C6000 | 0x000800 | RW | 0.06 | TLS directory + all-zero template |
+| 15 | `.rsrc` | 0x189B000 | 0x00C000 | 0x9C6800 | 0x00C000 | R | 7.08 | Resources (§19) |
+| 16 | `.winlice` | 0x18A7000 | **0x1C52000** | — | **0** | **RWX** | — | **Zero-filled on disk; filled at runtime with the unpacked SecureEngine kernel (29,696,000 bytes)** |
+| 17 | `.boot` | 0x34F9000 | 0x1582C00 | 0x9D2800 | 0x1582C00 | R+X | 7.89 | Boot kernel: `aPLib` depacker + block driver (§8.2) |
+| 18 | `.data` | 0x4A7C000 | 0x000400 | 0x1F55400 | 0x000400 | RW | 3.28 | Bootstrap data: strings, import-resolve tables, markers (§8.1.3) |
+| 19 | `.text` | 0x4A7D000 | 0x000600 | 0x1F55800 | 0x000600 | R+X | 2.68 | **Entry-point stub** (§5) |
+| 20 | `.reloc` | 0x4A7E000 | 0x001000 | 0x1F55E00 | 0x000054 | R | 4.59 | Relocations (only 2 blocks; see below) |
 
-**Section-name wiping rule — confirmed by perfect correlation.** Every section that has file-backed content had its name zeroed; the only two sections whose names survived (`.bss`, `.tls`) are exactly the two with `SizeOfRawData == 0`. The protector wipes the name of any section whose content it rewrites.
+\* Entropy computed over the full 0x200 raw bytes; the meaningful content is 0x90 high-entropy bytes.
 
-**Protector identification — confirmed.** `.winlice` and `.boot` are the documented Oreans section names. `.winlice` is a 28.3 MB **RWX** (`0xE0000060`) section with **zero raw bytes** — a pure runtime arena.
+Notes:
 
-### 2.5 Recovered original section layout — **strongly inferred**
+* `pefile` raises *"Suspicious flags set for section 16 (.winlice): both MEM_WRITE and MEM_EXECUTE"* — the RWX section is where the kernel is unpacked and executed. **[CONFIRMED]**
+* The relocation table contains only **34 fix-ups in 2 blocks**: one for the TLS directory fields (RVA 0x189A668–0x189A670) and 30 HIGHLOW fix-ups inside the `.text` entry stub itself (RVA 0x4A7D00D–0x4A7D261). Everything else is either position-independent or fixed up at runtime by the kernel. **[CONFIRMED]**
+* Sections 0–10 (RVA 0x1000…0x18Axxxx) largely **preserve the original program's section layout** (classic `.text` at RVA 0x1000, `.bss`, `.tls`, etc.) with contents replaced by ciphertext. **[STRONGLY INFERRED]**
 
-Combining the surviving names, the section flags, the exact virtual-size matches of the EXPORT (`0xB3`) and DELAY_IMPORT (`0xB34`) directories, and the ordering, the original image is reconstructed as a **Delphi XE2-or-later Win32 build** (modern RAD Studio uses lower-case dotted section names; Delphi ≤ 2010 used `CODE`/`DATA`/`BSS`):
+### 2.3 Data directories **[CONFIRMED]**
 
-```
- #  name       RVA         VSize        note
- 0  .text      0x00001000  0x00FFBFD4   16.0 MB of compiled Pascal/Object Pascal
- 1  .itext     0x00FFD000  0x0000916C   Embarcadero "initialization code" section
- 2  .data      0x01007000  0x00024314
- 3  .bss       0x0102C000  0x00009F5C   (name survives - no raw data)
- 4  .idata     0x01036000  0x00005B78   23 KB import table => large API surface
- 5  .didata    0x0103C000  0x00000B34   == DELAY_IMPORT dir size, exact match
- 6  .edata     0x0103D000  0x000000B3   == EXPORT dir size, exact match
- 7  .tls       0x0103E000  0x00000654   (name survives) Delphi threadvars
- 8  .rdata     0x0103F000  0x0000005D
- 9  .reloc     0x01040000  0x001820C0   1.5 MB of relocations
-10  .rsrc      0x011C3000  0x006CC4E8   6.8 MB of resources (VCL DFMs, images)
-```
+| Dir | RVA | Size | Note |
+|---|---|---|---|
+| Export | 0x1890000 | 0xB3 | Valid, in `.edata` (§2.5) |
+| Import | 0x1899329 | 0x27C | 20 DLLs, 33 functions (§4.1) |
+| Resource | 0x189B000 | 0xBFF4 | §19 |
+| Security (certificate) | **0x1F55E58** | **0x2870** | Authenticode, §2.4 |
+| BaseReloc | 0x4A7E000 | 0x54 | 2 blocks / 34 fixups |
+| TLS | 0x189A668 | 0x18 | §10.4 |
+| **Delay-Import** | 0x103C000 | 0xB34 | **Contains pseudo-random garbage, not delay imports** — encrypted configuration (§18) |
+| IAT / Debug / LoadConfig / BoundImports / CLR | 0 | 0 | Absent |
 
-Total original virtual extent ≈ `0x188F4E8` ≈ **24.6 MB**, versus ≈ 9.7 MB of (compressed + encrypted) on-disk content — an in-place expansion ratio of ~2.6×.
+### 2.4 Digital signature — **valid and verified** **[CONFIRMED]**
 
-### 2.6 Classification summary
+A `WIN_CERTIFICATE` header (length 0x2870, revision 0x0200, type 0x0002 = `PKCS_SIGNED_DATA`) is appended at file offset 0x1F55E58. OpenSSL parsing of the PKCS#7 shows:
 
-| Question | Answer | Confidence |
+* **Digest algorithm:** SHA-256; embedded indirect-data digest:
+  `27ce79462c82d368da3cfa079e2bc38bf366c703f23cefb4dce2e0eb4b730797`
+* **Independent recomputation** of the Authenticode image hash (headers with CheckSum and Security-Dir zeroed + everything up to the certificate table) yields **exactly the same digest** ⇒ the file is byte-for-byte the signed artifact; nothing was tampered with after signing.
+* **Certificate chain (5 certificates in the blob):**
+
+| Certificate | Issuer → Subject | Validity |
 |---|---|---|
-| Native or managed? | **Native x86**, no CLR header, no `mscoree` | confirmed |
-| Packed? | **Yes** — Themida/WinLicense 3.2.4.52 + aPLib + in-place section encryption | confirmed |
-| Obfuscated? | **Yes** — junk code, opaque predicates, fake return addresses, code mutation | confirmed |
-| Frameworks | Delphi/RAD Studio VCL + madExcept | strongly inferred |
-| Signed? | **Yes, and the digest verifies** | confirmed |
+| Certum Trusted Network CA 2 | Certum Trusted Network CA → Certum Trusted Network CA 2 (4096-bit RSA, SHA-384) | 2021-05-31 → 2029-09-17 |
+| Certum Code Signing 2021 CA | Certum Trusted Network CA 2 → Asseco Data Systems S.A. CN=Certum Code Signing 2021 CA | (in chain) |
+| **Leaf (signer)** | Certum Code Signing 2021 CA → **C=ES, ST=Cadiz, L=Jerez de la Frontera, O=Rafael Patricio Ahucha Ruiz, CN=Rafael Patricio Ahucha Ruiz** (4096-bit RSA, SHA-256) | **2024-05-27 → 2027-05-27** |
+| Certum Timestamping 2021 CA | Certum Trusted Network CA 2 → Asseco Data Systems S.A. CN=Certum Timestamping 2021 CA | (in chain) |
+| Certum Timestamp 2025 | Certum Timestamping 2021 CA → Asseco Data Systems S.A. CN=Certum Timestamp 2025 | 2025-01-09 → 2036-01-07 |
+
+* **RFC-3161 countersignature `signingTime` = 2025-10-10 09:25:29 UTC** — one minute after the PE link timestamp (09:24:29 UTC), i.e. the file was protected, then immediately signed. **[CONFIRMED]**
+* Signature semantic: a code-signing certificate issued to a Spanish private individual via Certum's code-signing program. Attribution of the *original program's authorship* to the signer is **not** implied — only that this person signed this exact protected artifact. **[CONFIRMED signature; UNCERTAIN attribution meaning]**
+
+### 2.5 Export directory **[CONFIRMED]**
+
+Internal name field: **`Themida.exe`** (ordinal base 1). Exports:
+
+| Ordinal | Name | RVA | VA |
+|---|---|---|---|
+| 1 | `dbkFCallWrapperAddr` | 0x102F5AC | 0x142F5AC |
+| 2 | `__dbk_fcall_wrapper` | 0x012660 | 0x0412660 |
+| 3 | `madTraceProcess` | 0x00B0CBC | 0x04B0CBC |
+| 4 | `TMethodImplementationIntercept` | 0x00DEB70 | 0x04DEB70 |
+
+These are **Delphi/madExcept integration symbols** (`__dbk_fcall_wrapper`/`dbkFCallWrapperAddr` are Delphi RTL debugger hooks; `madTraceProcess` belongs to madExcept/madTraceDebug; `TMethodImplementationIntercept` is a `System.Rtti` hook). The export directory of a protected file is normally the *original* program's; therefore the **pre-protection binary was a Delphi-built executable that internally named itself `Themida.exe`**. **[CONFIRMED symbols; STRONGLY INFERRED interpretation]**
+
+### 2.6 Packer identification **[CONFIRMED / STRONGLY INFERRED]**
+
+* Section names `.winlice`, `.boot`, `.vm_sec`, blank names, minimal one-function-per-DLL imports, and a stage-0 stub that decompresses an `aPLib` stream into an RWX section are the fingerprint of the **Oreans SecureEngine protector (Themida / WinLicense)**. The version resource pins the version: **3.2.4.52**.
+* After offline unpacking (§8.2–§8.3) an embedded DLL PDB path `Z:\Development\SecureEngine\src\plugins_manager\...` **confirms "SecureEngine"** as the runtime's internal project name. **[CONFIRMED]**
+* The `.winlice` section name is the characteristic marker of WinLicense-family builds (Themida-only builds classically use `.themida`); which of the two products produced this file cannot be distinguished statically. **[STRONGLY INFERRED]**
 
 ---
 
 ## 3. Architecture
 
-`Test2.exe` is a **self-decrypting container**. Three distinct bodies of code live in one address space:
-
-```
- VA 0x00400000 ─────────────────────────────────────────────────────── ImageBase
- │
- │  ┌──────────────────────────────────────────────────────────────┐
- │  │ LAYER 3 — PAYLOAD (Delphi/VCL application, ENCRYPTED)        │
- │  │   RVA 0x00001000 .. 0x0188F4E8   (24.6 MB virtual)           │
- │  │   .text .itext .data .bss .idata .didata .edata .tls         │
- │  │   .rdata .reloc .rsrc                                        │
- │  │   -> decrypted in place by Layer 2; not recoverable statically│
- │  └──────────────────────────────────────────────────────────────┘
- │
- │  ┌──────────────────────────────────────────────────────────────┐
- │  │ LAYER 2 — SecureEngine runtime (RECOVERED, but mutated)      │
- │  │   .winlice  RVA 0x018A7000 .. 0x034F9000  (28.3 MB, RWX)     │
- │  │   filled at run time by Layer 1; contains the licence engine,│
- │  │   anti-debug/anti-dump, the VM, and the payload decryptor    │
- │  └──────────────────────────────────────────────────────────────┘
- │
- │  ┌──────────────────────────────────────────────────────────────┐
- │  │ LAYER 1 — bootstrap (FULLY RECOVERED, plain x86)             │
- │  │   .text  0x04A7D000  entry stub ("skeleton.dll")             │
- │  │   .data  0x04A7C000  stub strings + import name pool         │
- │  │   .idata 0x01899000  IAT / DLL-preload list                  │
- │  │   .boot  0x034F9000  aPLib depacker + 32 packed streams      │
- │  └──────────────────────────────────────────────────────────────┘
- │
- VA 0x04E7F000 ────────────────────────────────────────── end of image
-```
-
-Control flows strictly upward through the layers: **Layer 1 builds Layer 2, Layer 2 decrypts and starts Layer 3.**
+The executable is a **four-layer system**:
 
 ```mermaid
 flowchart TD
-    OS["Windows loader"] -->|maps image, resolves .idata| EP["Layer 1: entry stub<br/>VA 0x04E7D000"]
-    EP -->|junk API loops x3| EP
-    EP -->|"leave / ret 0xC with<br/>faked return address"| BOOT["Layer 1: .boot+0x58<br/>VA 0x038F9058"]
-    BOOT -->|"call .boot+0x1A8"| REL["self-locating bootstrap<br/>computes base as .winlice"]
-    REL -->|"32 x aP_depack()"| WIN[".winlice arena filled<br/>0x1C52000 bytes"]
-    REL -->|"jmp base+0x12FD4B4"| SE["Layer 2: SecureEngine<br/>VA 0x02FA44B4, mutated"]
-    SE --> DEC["decrypt payload sections<br/>in place at RVA 0x1000..0x188F4E8"]
-    SE --> IAT["rebuild real IAT"]
-    SE --> LIC["licence / anti-tamper subsystems"]
-    DEC --> OEP["Layer 3: original Delphi entry point<br/>address unknown"]
-    IAT --> OEP
-    LIC --> OEP
-    OEP --> APP["Delphi RTL init, VCL, message loop"]
+    subgraph L0["Layer 0 — PE shell (plaintext)"]
+        HDR["PE headers, 21 sections, imports (20 DLLs / 33 fns),\nresources, exports, TLS dir, Authenticode"]
+        TEXTSTUB[".text @ 0x4E7D000 — entry stub\n(anti-analysis warm-up, stack trampoline)"]
+        DATASTUB[".data @ 0x4E7C000 — stub strings/tables"]
+    end
+    subgraph L1["Layer 1 — Boot kernel (plaintext, .boot @ 0x38F9000)"]
+        DRV["block driver @ 0x38F91A8"]
+        APLIB["aPLib depacker @ 0x38F905D"]
+        STREAM["22.5 MB aPacked stream @ 0x38F9206"]
+    end
+    subgraph L2["Layer 2 — SecureEngine kernel (decrypted at runtime into .winlice @ 0x1CA7000, RWX)"]
+        VMENTRY["VM entry / unpack flag @ +0x12FD4B4 (VA 0x2FA44B4)"]
+        VMI["VM interpreter + handlers (offsets 0x0–0x60000, ~0x1200000–0x13F0000, ~0x1A00000+)"]
+        VMPROG["encrypted VM bytecode (offsets 0x60000–0x280000 etc., H≈7.98)"]
+        PLUGINS["embedded PEs: XBundlerTlsHelper.dll (+0x56F0),\nprocess-restart helper.exe (+0x12EBA60)"]
+    end
+    subgraph L3["Layer 3 — Original program (encrypted, sections 0–10)"]
+        ORIG["Delphi application self-identified as Themida.exe 3.2.4.52\n(~16.7 MB VA of ciphertext)"]
+    end
+    TEXTSTUB -->|"ret 0xC -> 0x38F9058"| DRV
+    DRV --> APLIB
+    APLIB -->|"32 blocks x 928,000 B"| VMENTRY
+    DRV -->|"jmp [winlice+0x12FD4B4]"| VMENTRY
+    VMENTRY --> VMI
+    VMI <--> VMPROG
+    VMI -->|"decrypts / rebuilds / imports / jumps to OEP (inferred)"| ORIG
+    PLUGINS -.->|"loaded by kernel (inferred)"| L3
 ```
+
+* **Layer 0** is what the Windows loader sees: a tiny plaintext stub at the entry point plus metadata.
+* **Layer 1** is a plaintext decompressor ("boot kernel") whose only job is to materialize Layer 2.
+* **Layer 2** is the protector's runtime: a **code virtualization engine** (custom bytecode interpreter with per-instruction decryption and dispatch tables), the protection/licensing logic as VM bytecode, and small embedded native helper PEs.
+* **Layer 3** is the actual protected application, still encrypted on disk; the kernel decrypts/rebuilds it at run time and transfers control to its OEP. **[Layers 0–2 CONFIRMED by static reversal; Layer-3 runtime interaction STRONGLY INFERRED]**
 
 ---
 
 ## 4. Dependencies and External Interfaces
 
-### 4.1 Import table — **confirmed** (structure), **strongly inferred** (purpose)
+### 4.1 Static import table **[CONFIRMED]**
 
-The import directory lists **20 DLLs and only 33 functions in total** (19 of the 20 contribute just one or two). This is the classic protector "DLL-preload" pattern: the imports exist only so the Windows loader maps each DLL *before* the protector runs, allowing SecureEngine to resolve the real API set later by walking `PEB->Ldr` and the export tables.
+Twenty DLLs, 33 functions — a deliberate "minimal footprint" pattern typical of Themida (the real imports are rebuilt at runtime by the kernel; note `LoadLibraryA`, `GetProcAddress` equivalents are bootstrapped from `.data` tables, §4.3). All descriptors use `OriginalFirstThunk = 0` (import by FirstThunk only).
 
-| DLL | Imported symbol(s) | IAT slot (VA) | Referenced by the stub? |
-|---|---|---|---|
-| `kernel32.dll` | `GetModuleHandleA` | `01C994D0` | **yes** |
-| | `GetProcessHeap` | `01C994D4` | yes (junk) |
-| | `GetVersionExA` | `01C994D8` | yes (junk) |
-| | `HeapAlloc` | `01C994DC` | yes (junk) |
-| | `GetModuleHandleA` *(duplicate)* | `01C994E0` | no |
-| | `LoadLibraryA` | `01C994E4` | **yes** |
-| | `VirtualAlloc` | `01C994E8` | **yes** |
-| | `VirtualFree` | `01C994EC` | **yes** |
-| | `GetCurrentThreadId` | `01C994F0` | yes (junk) |
-| | `GetCommandLineA` | `01C994F4` | yes (junk) |
-| | `HeapFree` | `01C994F8` | yes (junk) |
-| | `FreeLibrary` | `01C994FC` | **yes** |
-| `oleaut32.dll` | `SysFreeString` | `01C99504` | no |
-| `advapi32.dll` | `RegQueryValueExW` | `01C9950C` | no |
-| `user32.dll` | `CharNextW` | `01C99514` | no |
-| | `MessageBoxA` | `01C99518` | **yes** |
-| `gdi32.dll` | `WidenPath` | `01C99520` | no |
-| `version.dll` | `VerQueryValueA` | `01C99528` | no |
-| `IMAGEHLP.DLL` | `ImageDirectoryEntryToData` | `01C99530` | no |
-| `SHFolder.dll` | `SHGetFolderPathW` | `01C99538` | no |
-| `netapi32.dll` | `NetWkstaGetInfo` | `01C99540` | no |
-| `ole32.dll` | `CreateILockBytesOnHGlobal` | `01C99548` | no |
-| `comctl32.dll` | `InitializeFlatSB` | `01C99550` | no |
-| | `ImageList_EndDrag` | `01C99554` | yes (junk) |
-| `shell32.dll` | `ShellExecuteExA` | `01C9955C` | no |
-| `comdlg32.dll` | `PrintDlgW` | `01C99564` | no |
-| `wsock32.dll` | `__WSAFDIsSet` | `01C9956C` | no |
-| `msvcrt.dll` | `memset` | `01C99574` | no |
-| `winspool.drv` | `OpenPrinterW` | `01C9957C` | no |
-| `winmm.dll` | `sndPlaySoundW` | `01C99584` | no |
-| `shlwapi.dll` | `PathRelativePathToW` | `01C9958C` | no |
-| `oledlg.dll` | `OleUIObjectPropertiesW` | `01C99594` | no |
-| `IMM32.dll` | `ImmSetCompositionWindow` | `01C9959C` | yes (junk) |
-
-The chosen function names are deliberately obscure (`WidenPath`, `__WSAFDIsSet`, `InitializeFlatSB`, `OleUIObjectPropertiesW`) — they are placeholders, not real dependencies of the stub.
-
-> **Inference about the payload.** The *DLL set* is meaningful even though the function names are not: a protector must preload every DLL the payload will need. This set is a textbook **Delphi VCL** dependency profile:
-> * `comctl32`, `comdlg32`, `shell32`, `shlwapi`, `oledlg`, `winspool.drv`, `imm32` → `Vcl.Forms`, `Vcl.Dialogs`, `Vcl.Printers`, `Vcl.OleCtnrs`
-> * `SHFolder!SHGetFolderPathW` → Delphi's `Vcl.SHFolder` / special-folder lookup
-> * `wsock32` → WinSock (Indy / `ScktComp` / raw sockets)
-> * `IMAGEHLP!ImageDirectoryEntryToData` + `netapi32!NetWkstaGetInfo` → **madExcept**, which uses ImageHlp for stack-trace symbolisation and NetWkstaGetInfo for machine details in bug reports. This corroborates the `madTraceProcess` export.
->
-> — **strongly inferred**
-
-### 4.2 Export table — **confirmed**
-
-`.edata` at RVA `0x01890000` (raw offset `0x9BD800`). Byte-level layout:
-
-```
-+0x00 Characteristics        00000000
-+0x04 TimeDateStamp          00000000
-+0x08 Major/MinorVersion     0000 0000
-+0x0C Name                   01890028 -> "Themida.exe"
-+0x10 Base                   00000001
-+0x14 NumberOfFunctions      00000004
-+0x18 NumberOfNames          00000004
-+0x1C AddressOfFunctions     01890093
-+0x20 AddressOfNames         018900A3
-+0x24 AddressOfNameOrdinals  0189008B
-+0x28 string pool:
-      "Themida.exe\0"                      (12 bytes, ends 0x34)
-      "TMethodImplementationIntercept\0"   (30 bytes, ends 0x52)
-      "__dbk_fcall_wrapper\0"              (20 bytes, ends 0x66)
-      "dbkFCallWrapperAddr\0"              (20 bytes, ends 0x7A)
-      "madTraceProcess\0"                  (16 bytes, ends 0x8A)
-+0x8B ordinals (4 x WORD)                  ends 0x93
-+0x93 functions (4 x DWORD)                ends 0xA3
-+0xA3 names     (4 x DWORD)                ends 0xB3   <-- total 0xB3
-```
-
-`0xB3` equals both the EXPORT data-directory size **and** the virtual size of the original (now-encrypted) `.edata` section at RVA `0x0103D000`. The protector therefore reproduced the payload's export directory **byte for byte**, only relocating it.
-
-| Ord | RVA | Name | Meaning |
-|---|---|---|---|
-| 1 | `0x0102F5AC` | `dbkFCallWrapperAddr` | Delphi debug-kernel pointer (lives in payload `.data`) |
-| 2 | `0x00012660` | `__dbk_fcall_wrapper` | Delphi debug-kernel thunk (payload `.text`) |
-| 3 | `0x000B0CBC` | `madTraceProcess` | **madExcept** stack-trace entry (payload `.text`) |
-| 4 | `0x000DEB70` | `TMethodImplementationIntercept` | Delphi `System.Rtti` (payload `.text`) |
-
-Exports 1, 2 and 4 are the default exports emitted by every RAD Studio Win32 binary [4](https://en.delphipraxis.net/topic/330-how-to-remove-default-dll-exports-delphi-rio/). Export 3 proves madExcept is linked in. Because the RVAs point into the payload's own code, the original module name at link time was `Themida.exe`. — **confirmed** (data), **strongly inferred** (conclusion).
-
-### 4.3 Digital signature — **confirmed and verified**
-
-* `WIN_CERTIFICATE`: length 10,352, revision `0x0200`, type `0x0002` (PKCS#7 `SignedData`).
-* Located at file offset `0x01F55E58`; `0x01F55E58 + 0x2870 = 0x1F586C8` = **exact end of file**, so there is **no additional overlay data**.
-
-Certificate chain:
-
-| Role | Subject | Validity |
-|---|---|---|
-| **Leaf (signer)** | `C=ES, ST=Cadiz, L=Jerez de la Frontera, O=Rafael Patricio Ahucha Ruiz, CN=Rafael Patricio Ahucha Ruiz` | 2024-05-27 → 2027-05-27 |
-| Intermediate | `CN=Certum Code Signing 2021 CA, O=Asseco Data Systems S.A., C=PL` | 2021-05-19 → 2036-05-18 |
-| Roots/TSA | `Certum Trusted Network CA`, `Certum Trusted Network CA 2`, `Certum Timestamping 2021 CA`, `Certum Timestamp 2025` | |
-
-* Digest algorithm: **SHA-256**; leaf signature algorithm `sha256WithRSAEncryption`; RSA **4096-bit** key.
-* `signingTime` attribute: **`251010092529Z` = 2025-10-10 09:25:29 UTC**, RFC-3161 counter-signed by Certum Timestamp 2025.
-
-**Integrity verification performed in this analysis:**
-
-```
-computed Authenticode PE digest : 27CE79462C82D368DA3CFA079E2BC38BF366C703F23CEFB4DCE2E0EB4B730797
-digest inside SpcIndirectData   : 27CE79462C82D368DA3CFA079E2BC38BF366C703F23CEFB4DCE2E0EB4B730797
-                                   ^ identical
-```
-
-The PE image is therefore **byte-identical to what the signer signed** — it has not been patched, trojanised or re-packed after signing. The stored PE `CheckSum` (`0x01F5D153`) also recomputes correctly. — **confirmed**.
-
-### 4.4 Build-timeline correlation — **confirmed**
-
-| Source | Timestamp (UTC) |
+| DLL | Imported functions |
 |---|---|
-| PE `TimeDateStamp` | 2025-10-10 **09:24:29** |
-| UTF-16 string at `.winlice+0x1EA4`: `Fri Oct 10 11:25:48 2025` | 09:25:48 (CEST = UTC+2, Spain) |
-| Authenticode `signingTime` | 2025-10-10 **09:25:29** |
+| kernel32.dll | `GetModuleHandleA` (×2 entries), `GetProcessHeap`, `GetVersionExA`, `HeapAlloc`, `LoadLibraryA`, `VirtualAlloc`, `VirtualFree`, `GetCurrentThreadId`, `GetCommandLineA`, `HeapFree`, `FreeLibrary` (12 IAT slots) |
+| oleaut32.dll | `SysFreeString` |
+| advapi32.dll | `RegQueryValueExW` |
+| user32.dll | `CharNextW`, `MessageBoxA` |
+| gdi32.dll | `WidenPath` |
+| version.dll | `VerQueryValueA` |
+| IMAGEHLP.DLL | `ImageDirectoryEntryToData` |
+| SHFolder.dll | `SHGetFolderPathW` |
+| netapi32.dll | `NetWkstaGetInfo` |
+| ole32.dll | `CreateILockBytesOnHGlobal` |
+| comctl32.dll | `InitializeFlatSB`, `ImageList_EndDrag` |
+| shell32.dll | `ShellExecuteExA` |
+| comdlg32.dll | `PrintDlgW` |
+| wsock32.dll | `__WSAFDIsSet` |
+| msvcrt.dll | `memset` |
+| winspool.drv | `OpenPrinterW` |
+| winmm.dll | `sndPlaySoundW` |
+| shlwapi.dll | `PathRelativePathToW` |
+| oledlg.dll | `OleUIObjectPropertiesW` |
+| IMM32.dll | `ImmSetCompositionWindow` |
 
-All three fall inside an ~80-second window on 2025-10-10, consistent with a single automated protect-then-sign build step executed in a UTC+2 timezone — matching the signer's location (Spain). The internal string is written by the protector at protection time.
+Most of these single imports are **stagers/decoys** ensuring the DLLs get mapped so the kernel can resolve further exports by hash/name at runtime. **[STRONGLY INFERRED]**
+
+### 4.2 Fake delay-import directory **[CONFIRMED content / STRONGLY INFERRED purpose]**
+
+The delay-import directory (RVA 0x103C000, 0xB34 bytes) contains **36 pseudo-random 32-byte "descriptor" records followed by a zero terminator** — the fields are uniformly random dwords (e.g. `0x9DFD18A0`, `0x2F79345B`, …), which cannot be real `ImgDelayDescr` structures. `pefile` aborts with *"Too many errors parsing the Delay import directory"*. This region is an **encrypted configuration blob** masquerading as a loader-ignored directory (see §18).
+
+### 4.3 Runtime import bootstrapping tables in `.data` **[CONFIRMED content / INFERRED usage]**
+
+The `.data` section holds plaintext hint/name/DLL triplets the kernel uses to resolve APIs dynamically:
+
+* 0x4E7C128–0x4E7C24A: `FreeLibrary`, `GetCommandLineA`, `GetCurrentThreadId`, `GetModuleHandleA`, `GetProcessHeap`, `GetVersionExA`, `HeapAlloc`, `HeapFree`, `LoadLibraryA`, `VirtualAlloc`, `VirtualFree` (all KERNEL32), `MessageBoxA`/USER32.dll, `ImmSetCompositionWindow`/IMM32.dll, `ImageList_EndDrag`/COMCTL32.dll — each with a hint byte prefix (e.g. hint 0x116 for `GetModuleHandleA`).
+* 0x4E7C06C: the ASCII string `kernel32.dll` (used by the entry stub's `LoadLibraryA` churn loop, §5).
+* 0x4E7C288 / 0x4E7C296: the strings **`skeleton.dll`** and **`TestHello`** — a bundled-file registration record (the SecureEngine *XBundler* embeds DLLs inside the protected image; `TestHello` looks like an export to test-load). **[CONFIRMED strings; STRONGLY INFERRED purpose given the recovered XBundler plugin, §8.4]**
+* 0x4E7C000 and 0x4E7C0E0: two identical 14-dword tables of small values (0x212C–0x222A), plus further small-value tables at 0x4E7C080–0x4E7C0CC (0x2008–0x2220) and around 0x4E7C254–0x4E7C296 (0x1147, 0x2278–0x228F) — 14 entries matching the 14 hint/name entries above; their indexing base is still **[UNCERTAIN]** (best candidate: RVA-based indices into the encrypted original program's import area). See §27.6.
+
+### 4.4 External system interfaces (static evidence only) **[CONFIRMED imports; runtime use INFERRED]**
+
+* **Registry:** `RegQueryValueExW` (advapi32) — value reads (WinLicense licensing/protection options commonly live under `HKLM\SOFTWARE\...`; exact keys not recoverable).
+* **Environment/system probing:** `GetVersionExA`, `VerQueryValueA` (OS version), `NetWkstaGetInfo` (workstation/account domain info — typical machine-fingerprint input for licensing), `SHGetFolderPathW` (special-folder paths).
+* **GUI:** `MessageBoxA`, `CharNextW`, `InitializeFlatSB`, `ImmSetCompositionWindow`.
+* **Shell/print/media:** `ShellExecuteExA`, `PrintDlgW`, `OpenPrinterW`, `sndPlaySoundW`, `OleUIObjectPropertiesW`, `WidenPath`, `PathRelativePathToW`, `CreateILockBytesOnHGlobal` — these look like remnants of the original Delphi application's feature set (print dialogs, OLE, sound), pulled in as single decoy imports. **[INFERRED]**
+* **Networking:** only `wsock32.dll!__WSAFDIsSet` (a `select()` helper). **No URLs, hostnames, or IP literals exist in any recoverable plaintext** except the certificate chain's CRL/OCSP URLs (§17).
 
 ---
 
-## 5. Entry Point
+## 5. Entry Point (VA 0x4E7D000)
 
-**`AddressOfEntryPoint = 0x04A7D000` → VA `0x04E7D000`**, inside the protector's `.text` (section 19, raw offset `0x01F55800`). Only `0x265` of the section's `0x600` bytes are used; the rest is zero padding.
+The entry stub is 0x600 bytes of plaintext x86 in `.text`. Annotated reconstruction (confirmed by Capstone disassembly):
 
-### 5.1 Complete disassembly of the entry stub — **confirmed**
+### 5.1 Prologue — return-address trampoline **[CONFIRMED]**
 
 ```asm
-; ---- entry point -------------------------------------------------------
-04E7D000  ff74240c        push  dword [esp+0xC]     ; forward arg 3
-04E7D004  ff74240c        push  dword [esp+0xC]     ; forward arg 2
-04E7D008  ff74240c        push  dword [esp+0xC]     ; forward arg 1
-04E7D00C  b858908f03      mov   eax, 0x038F9058     ; <-- .boot + 0x58   (RELOCATED)
-04E7D011  50              push  eax                 ; FAKE RETURN ADDRESS
-04E7D012  e900000000      jmp   0x04E7D017          ; jmp +0 (disassembly desync bait)
-04E7D017  55              push  ebp
-04E7D018  8bec            mov   ebp, esp            ; [ebp+4] == 0x038F9058
-04E7D01A  e9d1000000      jmp   0x04E7D0F0          ; -> loop guard
-
-; ---- junk / anti-emulation body, executed exactly 3 times --------------
-04E7D01F  b823d2e704      mov   eax, 0x04E7D223     ; dead
-04E7D024  c1e810          shr   eax, 0x10           ; dead
-04E7D027  0513090000      add   eax, 0x913          ; dead
-04E7D02C  25ff1f0000      and   eax, 0x1FFF         ; dead
-04E7D031  8bc8            mov   ecx, eax            ; dead
-04E7D033  b900000100      mov   ecx, 0x10000        ; overwritten
-04E7D038  b823d2e704      mov   eax, 0x04E7D223     ; dead
-04E7D03D  81e100060000    and   ecx, 0x600          ; overwritten
-04E7D043  b900080000      mov   ecx, 0x800          ; <-- real: loop count = 2048
-04E7D048  eb42            jmp   0x04E7D08C
-; -- loop A (2048 iterations) --
-04E7D04A  81f900020000    cmp   ecx, 0x200
-04E7D050  7600            jbe   0x04E7D052          ; jbe +0  (opaque, always falls through)
-04E7D052  51              push  ecx
-04E7D053  6a00            push  0
-04E7D055  e8c9010000      call  0x04E7D223          ; GetModuleHandleA(NULL)
-04E7D05A  686cc0e704      push  0x04E7C06C          ; "kernel32.dll"
-04E7D05F  e8dd010000      call  0x04E7D241          ; LoadLibraryA("kernel32.dll")
-04E7D064  50              push  eax
-04E7D065  e8a7010000      call  0x04E7D211          ; FreeLibrary(hKernel32)
-04E7D06A  6a04            push  4                   ; PAGE_READWRITE
-04E7D06C  6800100000      push  0x1000              ; MEM_COMMIT
-04E7D071  6800100000      push  0x1000              ; dwSize = 4096
-04E7D076  6a00            push  0                   ; lpAddress = NULL
-04E7D078  e8ca010000      call  0x04E7D247          ; VirtualAlloc(...)
-04E7D07D  6800800000      push  0x8000              ; MEM_RELEASE
-04E7D082  6a00            push  0
-04E7D084  50              push  eax
-04E7D085  e8c3010000      call  0x04E7D24D          ; VirtualFree(p, 0, MEM_RELEASE)
-04E7D08A  59              pop   ecx
-04E7D08B  49              dec   ecx
-04E7D08C  0bc9            or    ecx, ecx
-04E7D08E  75ba            jne   0x04E7D04A
-; -- loop B (0x1300 = 4864 iterations, same body minus LoadLibrary) --
-04E7D090  b900130000      mov   ecx, 0x1300
-      ... (identical GetModuleHandleA / VirtualAlloc / VirtualFree body) ...
-04E7D0CB  75ca            jne   0x04E7D097
-; -- loop C (0x1800 = 6144 iterations, GetModuleHandleA only) --
-04E7D0CD  b900180000      mov   ecx, 0x1800
-04E7D0D4  81f900020000    cmp   ecx, 0x200
-04E7D0DA  7600            jbe   0x04E7D0DC
-04E7D0DC  51              push  ecx
-04E7D0DD  6a00            push  0
-04E7D0DF  e83f010000      call  0x04E7D223          ; GetModuleHandleA(NULL)
-04E7D0E4  59              pop   ecx
-04E7D0E5  49              dec   ecx
-04E7D0E6  0bc9            or    ecx, ecx
-04E7D0E8  75ea            jne   0x04E7D0D4
-04E7D0EA  ff0579c0e704    inc   dword [0x04E7C079]  ; outer counter (in .data)
-; ---- outer loop guard: repeat the whole junk body 3 times --------------
-04E7D0F0  833d79c0e70403  cmp   dword [0x04E7C079], 3
-04E7D0F7  0f8222ffffff    jb    0x04E7D01F
-
-; ---- three dead MessageBoxA branches (opaque predicates) ---------------
-04E7D0FD  817d0c3041ab00  cmp   dword [ebp+0xC], 0x00AB4130   ; fdwReason == 0xAB4130 ?
-04E7D104  7515            jne   0x04E7D11B
-04E7D106  6a00            push  0
-04E7D108  6848c0e704      push  0x04E7C048          ; "dummy"
-04E7D10D  6854c0e704      push  0x04E7C054          ; "dummy"
-04E7D112  6a00            push  0
-04E7D114  e83a010000      call  0x04E7D253          ; MessageBoxA(0,"dummy","dummy",0)
-04E7D119  eb3a            jmp   0x04E7D155
-04E7D11B  817d0c3041ab00  cmp   dword [ebp+0xC], 0x00AB4130   ; same constant again
-04E7D122  7515            jne   0x04E7D139
-      ... identical dead branch ...
-04E7D139  817d0c3041ab00  cmp   dword [ebp+0xC], 0x00AB4130   ; and a third time
-04E7D140  7513            jne   0x04E7D155
-      ... identical dead branch ...
-
-; ---- the actual transfer of control -----------------------------------
-04E7D155  b800000000      mov   eax, 0
-04E7D15A  c9              leave                     ; esp <- ebp ; pop ebp
-04E7D15B  c20c00          ret   0xC                 ; *** jumps to 0x038F9058, pops 12 bytes ***
+0x4E7D000  push dword [esp+0xC]     ; v3 = loader-stack value @ entry_esp+4
+0x4E7D004  push dword [esp+0xC]     ; v2 = loader-stack value @ entry_esp+8   (note: esp moved!)
+0x4E7D008  push dword [esp+0xC]     ; v1 = loader-stack value @ entry_esp+0xC
+0x4E7D00C  mov  eax, 0x38F9058      ; .boot+0x58  (the block-driver call site)
+0x4E7D011  push eax                 ; forged "return address"
+0x4E7D012  jmp  0x4E7D017
+0x4E7D017  push ebp                 ; frame for the "function"
+0x4E7D018  mov  ebp, esp
+0x4E7D01A  jmp  0x4E7D0F0           ; -> pass-gate (loop head)
 ```
 
-### 5.2 Why `ret 0xC` is the real jump — **confirmed**
+Each `push [esp+0xC]` reads a *different* stack slot because `esp` moves — an obfuscated copy of the three loader-supplied dwords above the initial return address. The stub then establishes a normal EBP frame and jumps to the loop gate.
 
-The stub is a compiled `DllMain(hinstDLL, fdwReason, lpvReserved)` whose prologue was hand-edited. Stack layout after `push ebp; mov ebp, esp`:
+**Stack-preservation invariant [CONFIRMED by arithmetic]:** on `leave; ret 0xC` (0x4E7D15A–0x4E7D15B), the CPU pops `0x38F9058` into EIP, the `0xC` pops the three pushed dwords, and **ESP is restored to exactly the original entry value** — the boot kernel therefore starts with the pristine loader stack (including the loader's own return address).
 
-```
-  [ebp+0x00] = saved EBP
-  [ebp+0x04] = 0x038F9058          <-- pushed at 04E7D011, occupies the return-address slot
-  [ebp+0x08] = hinstDLL   (forwarded)
-  [ebp+0x0C] = fdwReason  (forwarded)   <-- compared against 0xAB4130
-  [ebp+0x10] = lpvReserved(forwarded)
-```
+### 5.2 Three "warm-up" passes × 3 rounds — anti-analysis loop nest **[CONFIRMED code; purpose STRONGLY INFERRED]**
 
-`leave` sets `esp = ebp` then pops EBP, so `esp` now points at `0x038F9058`; `ret 0xC` pops it into EIP and discards the three forwarded arguments. **The stub "returns" straight into the packed body.** This defeats naive call-graph reconstruction — no `call`/`jmp` instruction ever references `.boot`.
+Gate at 0x4E7D0F0:
 
-The three `cmp [ebp+0xC], 0xAB4130` tests are **opaque predicates**: `0xAB4130` is not a valid `DLL_PROCESS_ATTACH`/`_DETACH`/`THREAD_*` value, and comparing the same operand against the same constant three times in sequence guarantees all three `MessageBoxA("dummy","dummy")` blocks are unreachable.
-
-### 5.3 Unconsumed SDK protection-macro markers — **confirmed**
-
-`.text` contains an **unreachable tail** (`0x04E7D15E`–`0x04E7D20F`; unreachable because `ret 0xC` at `0x04E7D15B` never falls through) that preserves the **Oreans SDK protection-macro sentinels** verbatim. Raw bytes:
-
-```
-04E7D15E  eb 10                                   jmp 0x04E7D170   ; hop over marker
-04E7D160  57 4c 20 20  0c 00 00 00  00 00 00 00  57 4c 20 20
-          "WL  "       id = 0x0C     pad          "WL  "           ; START marker block
-04E7D170  be 53 d2 e7 04                          mov  esi, 0x04E7D253
-04E7D175  6a 00 68 48 c0 e7 04 68 4e c0 e7 04 6a 00 ff d6
-                                                  MessageBoxA(0,"dummy","dummy",0)
-04E7D185  eb 10                                   jmp 0x04E7D197   ; hop over marker
-04E7D187  57 4c 20 20  0d 00 00 00  00 00 00 00  57 4c 20 20
-          "WL  "       id = 0x0D     pad          "WL  "           ; END marker block
-04E7D197  01 be ad de                             dd 0xDEADBE01    ; START marker
-04E7D19B  53 51 b9 ... 81 04 24 81 01 42 00 c7 04 24 01 ad ef be
-                                                  ; guarded body: arithmetic-obfuscated
-                                                  ; constant builder ending in 0xBEEFAD01
-04E7D1DE  02 be ad de                             dd 0xDEADBE02    ; END marker
-04E7D1E2  c3                                      ret
-04E7D1E3  e8 3b 00 00 00 ... e8 4f 00 00 00       ImportAnchor: 8 calls, one per thunk
-04E7D210  cc                                      int3
-04E7D211..04E7D264                                14 IAT jump thunks
+```asm
+0x4E7D0F0  cmp  dword [0x4E7C079], 3   ; pass-round counter in .data
+0x4E7D0F7  jb   0x4E7D01F              ; repeat the whole 3-pass body 3x
 ```
 
-Two distinct sentinel schemes are present, both **left unprocessed in the shipped file**:
+**Pass A** (0x4E7D01F–0x4E7D08E, count `ecx = 0x800` = 2,048 iterations — note the decoy `mov ecx,0x10000` / `and ecx,0x600` instructions that are immediately overwritten by `mov ecx,0x800`):
 
-| Scheme | Encoding | Instances |
+```asm
+loopA:  push ecx
+        push 0                    ; lpModuleName = NULL
+        call [GetModuleHandleA]   ; thunk 0x4E7D223 -> IAT 0x1C994D0
+        push 0x4E7C06C            ; "kernel32.dll"
+        call [LoadLibraryA]       ; thunk 0x4E7D241 -> IAT 0x1C994E4
+        push eax
+        call [FreeLibrary]        ; thunk 0x4E7D211 -> IAT 0x1C994FC
+        push 4                    ; PAGE_READWRITE
+        push 0x1000               ; MEM_COMMIT
+        push 0x1000               ; size 4 KiB
+        push 0                    ; NULL
+        call [VirtualAlloc]       ; thunk 0x4E7D247 -> IAT 0x1C994E8
+        push 0x8000               ; MEM_RELEASE
+        push 0
+        push eax
+        call [VirtualFree]        ; thunk 0x4E7D24D -> IAT 0x1C994EC
+        pop ecx / dec ecx / or ecx,ecx / jne loopA
+```
+
+**Pass B** (0x4E7D090–0x4E7D0CB, `ecx = 0x1300` = 4,864 iterations): `GetModuleHandleA(NULL)` + `VirtualAlloc`/`VirtualFree` (no LoadLibrary).
+**Pass C** (0x4E7D0CD–0x4E7D0E8, `ecx = 0x1800` = 6,144 iterations): `GetModuleHandleA(NULL)` only.
+
+Each pass body also contains dead decoy instructions (`cmp ecx,0x200 / jbe <next instruction>` jumping into the immediately following instruction, junk arithmetic on `eax` derived from a code address — e.g. `mov eax,0x4E7D223; shr eax,16; add eax,0x913; and eax,0x1FFF` whose result is discarded). **[CONFIRMED junk]**
+
+Aggregate call counts (3 rounds × per-pass counts):
+
+| API | Calls |
+|---|---|
+| `GetModuleHandleA(NULL)` | 3 × (2,048 + 4,864 + 6,144) = **39,168** |
+| `VirtualAlloc`/`VirtualFree` 4 KiB pairs | 3 × (2,048 + 4,864) = **20,736** |
+| `LoadLibraryA("kernel32.dll")`/`FreeLibrary` | 3 × 2,048 = **6,144** |
+
+Purpose: this is the classic Themida entry-stub behavior — a **timing/anti-emulation gauntlet** (tens of thousands of quick API calls and allocator churn that slow and destabilize naive emulators, sandboxes and tracers) that doubles as heap priming. **[STRONGLY INFERRED — mechanism confirmed, intent not provable]**
+
+### 5.3 Conditional "dummy" MessageBox path **[CONFIRMED code; trigger condition UNCERTAIN]**
+
+```asm
+0x4E7D0EA  inc  dword [0x4E7C079]        ; round++
+0x4E7D0F0  cmp  dword [0x4E7C079], 3 ; jb loop
+; --- after 3 rounds ---
+0x4E7D0FD  cmp  dword [ebp+0xC], 0xAB4130   ; v2 == magic?  (repeated 3x, obfuscated if-chain)
+0x4E7D104  jne  next_compare
+0x4E7D106  push 0            ; uType = MB_OK
+0x4E7D108  push 0x4E7C048    ; lpCaption -> "dummy"
+0x4E7D10D  push 0x4E7C054    ; lpText    -> "dummy"
+0x4E7D112  push 0            ; hWnd = NULL
+0x4E7D114  call [MessageBoxA]    ; thunk 0x4E7D253 -> IAT 0x1C99518
+... two more identical compares selecting texts at 0x4E7C05A / 0x4E7C060 ...
+0x4E7D155  mov  eax, 0        ; return value 0
+0x4E7D15A  leave
+0x4E7D15B  ret  0xC           ; -> 0x38F9058 (boot kernel), stack pristine
+```
+
+`.data` contains **five consecutive `"dummy"` strings** at 0x4E7C048, 0x4E7C04E, 0x4E7C054, 0x4E7C05A, 0x4E7C060. The magic constant `0xAB4130` compared against a loader-placed stack dword is a WinLicense-style marker check; on a normal launch the compare fails and no message box appears. **[CONFIRMED code path; the semantic of 0xAB4130 and who could satisfy it: UNCERTAIN]**
+
+### 5.4 Unreachable decoy block (0x4E7D15E–0x4E7D210) **[CONFIRMED bytes; reachability/purpose UNCERTAIN]**
+
+After `ret 0xC`, a second code block sits inline in `.text`:
+
+* `0x4E7D170`: another `MessageBoxA(NULL, "dummy"@0x4E7C04E, "dummy"@0x4E7C048, 0)`;
+* `0x4E7D19D–0x4E7D1DE`: obfuscated constant materialization on the stack — `movl $0x37C8004B,(%esp); subl $0x3BF61806; orl $0x6F6D763E; decl; incl; addl $0x420181; movl $0xBEEFAD01,(%esp)` followed by bytes `02 BE AD DE C3` (an embedded `0xDEADBE…`-style pattern). `0xBEEFAD01`/"dead-beef" style magic constants and the inline `"WL  \x0C"`, `"WL  \x0D"`, `"WL  \x01"` marker strings at 0x4E7D160/0x4E7D188/0x4E7D193 are WinLicense signatures the kernel searches for / patches. **[STRONGLY INFERRED for the markers]**
+* `0x4E7D1E8–0x4E7D20B`: eight sequential calls to import thunks — `GetCurrentThreadId`, `GetCommandLineA`, `HeapFree`, `HeapAlloc`, `GetVersionExA`, `GetProcessHeap`, `ImmSetCompositionWindow`, `ImageList_EndDrag` — **with garbage arguments** (the stack was filled with the magic constants), ending in `int3` (0x4E7D210). Executed as-is this would be non-sensical/crashing; it is a decoy or a kernel-patched template. **[CONFIRMED instruction stream; never reachable via fallthrough — purpose UNCERTAIN]**
+
+### 5.5 Import thunks **[CONFIRMED]**
+
+`0x4E7D211–0x4E7D25F` are 12 `jmp dword [IAT]` thunks into `.idata`:
+
+| Thunk VA | IAT slot | Target |
 |---|---|---|
-| `"WL  "` blocks | `"WL  "` + 4-byte macro id + 4-byte pad + `"WL  "`, preceded by a `jmp` that skips them | id `0x0C` at `04E7D160`, id `0x0D` at `04E7D187` |
-| `0xDEADBExx` | bare little-endian dword | `0xDEADBE01` at `04E7D197`, `0xDEADBE02` at `04E7D1DE` |
-
-The pattern — `jmp` over a start sentinel, a short guarded body, `jmp` over a matching end sentinel — is precisely how the Themida/WinLicense SDK macros (`VM_START`/`VM_END`, `CHECK_PROTECTION`, …) are emitted into source before the protection tool rewrites the bracketed code. Here they wrap a sample `MessageBoxA("dummy","dummy")` call and a junk constant-builder: leftovers of the Oreans **template project**, never rewritten because this stub *is* the protector's own loader rather than user code. — **confirmed** (bytes); **strongly inferred** (interpretation).
-
-`.data` at `0x04E7C282` / `0x04E7C28F` holds **`skeleton.dll`** and **`TestHello`** — the module name and exported function of that template DLL project. The PDB path recovered from `.winlice` (`Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\embedded dlls\...`) shows the same build tree.
-
-### 5.4 Relocations — **confirmed**
-
-Only **two** relocation blocks survive (`.reloc`, 84 bytes total):
-
-| Block RVA | Entries | Contents |
-|---|---|---|
-| `0x0189A000` | 3 × `HIGHLOW` + 1 pad | `0189A668`, `0189A66C`, `0189A670` — the three pointer fields of the relocated TLS directory |
-| `0x04A7D000` | 29 × `HIGHLOW` + 1 pad | every absolute address in the entry stub, including `04A7D00D` (the `mov eax, 0x038F9058` fake-return constant) and all 14 IAT thunk operands at `04A7D213`–`04A7D261` |
-
-The payload's own 1.5 MB `.reloc` (section 9) is encrypted and is applied later by SecureEngine, not by the Windows loader.
+| 0x4E7D211 | 0x1C994FC | kernel32.FreeLibrary |
+| 0x4E7D217 | 0x1C994F4 | kernel32.GetCommandLineA |
+| 0x4E7D21D | 0x1C994F0 | kernel32.GetCurrentThreadId |
+| 0x4E7D223 | 0x1C994D0 | kernel32.GetModuleHandleA |
+| 0x4E7D229 | 0x1C994D4 | kernel32.GetProcessHeap |
+| 0x4E7D22F | 0x1C994D8 | kernel32.GetVersionExA |
+| 0x4E7D235 | 0x1C994DC | kernel32.HeapAlloc |
+| 0x4E7D23B | 0x1C994F8 | kernel32.HeapFree |
+| 0x4E7D241 | 0x4E7D241→0x1C994E4 | kernel32.LoadLibraryA |
+| 0x4E7D247 | 0x1C994E8 | kernel32.VirtualAlloc |
+| 0x4E7D24D | 0x1C994EC | kernel32.VirtualFree |
+| 0x4E7D253 / 0x4E7D259 / 0x4E7D25F | 0x1C99518 / 0x1C9959C / 0x1C99554 | user32.MessageBoxA / IMM32.ImmSetCompositionWindow / COMCTL32.ImageList_EndDrag |
 
 ---
 
 ## 6. Complete Initialization Flow
 
-### Stage 0 — Windows loader (before any image code runs) — **confirmed**
+From process creation to the point where protected-application code becomes active:
 
-1. `CreateProcess` maps `Test2.exe` at `0x00400000` (no ASLR — `DllCharacteristics == 0`).
-2. All 21 sections are mapped. `.winlice` (28.3 MB) is committed as **zero-filled RWX**; `.bss` and the payload `.tls` are likewise zero-filled.
-3. The loader parses `.idata` (RVA `0x1899329`) and **loads all 20 DLLs**: `kernel32, oleaut32, advapi32, user32, gdi32, version, imagehlp, shfolder, netapi32, ole32, comctl32, shell32, comdlg32, wsock32, msvcrt, winspool.drv, winmm, shlwapi, oledlg, imm32`, writing 33 IAT slots at `0x01C994D0`–`0x01C9959C`.
-4. The activation-context manager processes `RT_MANIFEST` #1: Common-Controls v6.0 side-by-side binding, `dpiAware = True/PM`, `requestedExecutionLevel = asInvoker` (**no elevation requested**).
-5. The TLS directory at `0x0189A668` is processed: raw template `0x01C9A000`–`0x01C9A654` (0x654 bytes, all zero), index slot `0x01C9A658`, **`AddressOfCallBacks = 0`** — *no TLS callbacks run*.
-6. Base relocations are applied: 34 entries, of which 32 are `HIGHLOW` and 2 are `ABSOLUTE` padding.
-7. Control transfers to `0x04E7D000`.
+1. **Windows loader maps the image** (~74.9 MB VA). `.bss`, both `.tls` sections and `.winlice` are zero-filled (`.winlice` has `SizeOfRawData = 0`). The loader resolves 20 import DLLs / 33 functions and applies the 34 relocations (TLS dir + entry stub). The TLS directory (§10.4) has **no callbacks**, so no extra user code runs before the EP.
+2. **EP stub runs** (§5): builds its trampoline frame, executes 3 rounds × 3 passes of the API warm-up gauntlet (39,168 `GetModuleHandleA`, 20,736 `VirtualAlloc`+`VirtualFree`, 6,144 `LoadLibraryA`+`FreeLibrary`), tests the `0xAB4130` stack magic (normally false), then `ret 0xC` → **EIP = 0x38F9058** with a pristine stack.
+3. **Boot kernel `0x38F9058`** (§8.2): `call 0x38F91A8` — the block driver.
+4. **Block driver `0x38F91A8`**:
+   a. pops the return address (0x38F905D) into EAX and computes `EBX = EAX − 5 − 0x1C52058 = 0x1CA7000` — the **`.winlice` base** — from its own call site (position-independent self-location).
+   b. checks `dword [.winlice + 0x12FD4B4] == 0` (fresh process ⇒ true, since `.winlice` is zero-filled) — an idempotency/"already unpacked" flag that doubles as the kernel entry point.
+   c. reads the block count byte (32) at `.boot+0x206` (VA 0x38F9206, file 0x9D2A07) and, for each block, calls the **`aPLib` depacker at 0x38F905D** (`call eax`) with (source, 0, dest, …).
+   d. after 32 blocks, `jmp eax` where `eax = 0x1CA7000 + 0x12FD4B4 = 0x2FA44B4`.
+5. **SecureEngine VM kernel starts at 0x2FA44B4** inside the freshly unpacked `.winlice` image (§8.3). The first bytes (`55 E9 …` = `push ebp; jmp …`) enter the VM, which sets up an EBP-relative VM context and interprets encrypted bytecode. **[CONFIRMED unpacking + interpreter mechanics; the kernel's subsequent actions are STRONGLY INFERRED:]**
+   * environment/anti-debug checks, decryption of the original program sections (RVA 0x1000 / 0xFFD000 et al.),
+   * reconstruction of the real import table (using the `.data` bootstrap name tables and `LoadLibraryA`/`GetProcAddress`),
+   * registration of bundled files (XBundler — e.g. `skeleton.dll`) and loading of the embedded TLS-helper DLL,
+   * WinLicense licensing logic (machine fingerprinting via `NetWkstaGetInfo`, registry reads, key checks),
+   * creation of protection threads (monitor/anti-tamper) — none of which is statically observable,
+   * and finally a transfer to the **OEP of the original Delphi program**, which then runs as a normal GUI application with the kernel resident.
 
-> **Note.** The absence of TLS callbacks is significant: many protectors place anti-debug code there. This build does not.
-
-### Stage 1 — Entry stub (`.text`, `0x04E7D000`) — **confirmed**
-
-1. Forward three stack dwords; push the constant `0x038F9058` as a **fake return address**; build a frame.
-2. Run the junk body three times (outer counter at `.data:0x04E7C079`, guard `cmp …, 3`). Each pass issues:
-   * loop A — 2,048 × { `GetModuleHandleA(NULL)`, `LoadLibraryA("kernel32.dll")`, `FreeLibrary`, `VirtualAlloc(4 KB, MEM_COMMIT, PAGE_READWRITE)`, `VirtualFree(MEM_RELEASE)` }
-   * loop B — 4,864 × { `GetModuleHandleA`, `VirtualAlloc`, `VirtualFree` }
-   * loop C — 6,144 × { `GetModuleHandleA` }
-   Totals per process start: **39,168 `GetModuleHandleA`, 6,144 `LoadLibraryA` + 6,144 `FreeLibrary`, 20,736 `VirtualAlloc` + 20,736 `VirtualFree` — 92,928 calls in all.**
-3. Evaluate three opaque predicates (all false) — the `MessageBoxA("dummy","dummy")` paths are dead.
-4. `leave` / `ret 0xC` → **`0x038F9058`**.
-
-### Stage 2 — Self-locating bootstrap (`.boot+0x1A8`) — **confirmed**
-
-```asm
-038F9058  e84b010000   call 0x038F91A8      ; pushes 0x038F905D
-;                        ^ the aPLib depacker function begins at 0x038F905D
-
-038F91A8  58           pop  eax             ; eax = 0x038F905D (runtime address of the depacker)
-038F91A9  53 51 52 56 57 55                 ; push ebx,ecx,edx,esi,edi,ebp
-038F91AF  89c3         mov  ebx, eax
-038F91B1  83eb05       sub  ebx, 5          ; ebx = VA(.boot+0x58)
-038F91B4  b95820c501   mov  ecx, 0x01C52058
-038F91B9  29cb         sub  ebx, ecx        ; ebx = VA(.boot+0x58) - 0x1C52058
-;                                             = ImageBase + 0x34F9058 - 0x1C52058
-;                                             = ImageBase + 0x018A7000  == .winlice  <<<<
-038F91BB  50           push eax
-038F91BC  b8b4d42f01   mov  eax, 0x012FD4B4
-038F91C1  01d8         add  eax, ebx        ; eax = .winlice + 0x12FD4B4
-038F91C3  833800       cmp  dword [eax], 0
-038F91C6  7403         je   decompress
-038F91C8  58           pop  eax
-038F91C9  eb2c         jmp  done            ; already unpacked -> skip (re-entrancy guard)
-
-decompress:
-038F91CB  58           pop  eax
-038F91CC  b9ae010000   mov  ecx, 0x1AE
-038F91D1  83e905       sub  ecx, 5
-038F91D4  01c1         add  ecx, eax        ; ecx = VA(.boot + 0x206)  <- stream table
-038F91D6  53           push ebx
-038F91D7  89ce         mov  esi, ecx        ; esi -> table
-038F91D9  89df         mov  edi, ebx        ; edi -> .winlice (destination cursor)
-038F91DB  8a0e         mov  cl, [esi]       ; cl = stream count  (= 0x20 = 32)
-038F91DD  46           inc  esi
-loop:
-038F91DE  84c9         test cl, cl
-038F91E0  7414         je   end
-038F91E2  51 50        push ecx / push eax
-038F91E4  57 6a00 57 6a00 56                ; push edi,0,edi,0,esi
-038F91EB  ffd0         call eax             ; aP_depack(src=esi, 0, dst=edi, 0, edi)
-038F91ED  5f           pop  edi
-038F91EE  01c7         add  edi, eax        ; advance destination by decompressed size
-038F91F0  58 59        pop  eax / pop ecx
-038F91F2  fec9         dec  cl
-038F91F4  ebe8         jmp  loop            ; ESI is NOT restored -> already points at the next stream
-end:
-038F91F6  5b           pop  ebx
-done:
-038F91F7  b8b4d42f01   mov  eax, 0x012FD4B4
-038F91FC  01d8         add  eax, ebx
-038F91FE  5d 5f 5e 5a 59 5b                 ; pop ebp,edi,esi,edx,ecx,ebx
-038F9204  ffe0         jmp  eax             ; -> .winlice + 0x12FD4B4 = VA 0x02FA44B4
-```
-
-The base computation is self-verifying: `0x34F9058 − 0x1C52058 = 0x018A7000`, which is **exactly** the `.winlice` RVA from the section table.
-
-### Stage 3 — aPLib decompression — **confirmed and reproduced**
-
-The stream table at `.boot+0x206` begins with the byte `0x20` (32), followed immediately by 32 concatenated aPLib streams. Running the re-implemented depacker:
-
-```
-stream count = 32 (0x20)
-  stream  0: in @0x00000207 len=795059    out=+0x00000000 size=0xe2900
-  stream  1: in @0x000c23ba len=1006617   out=+0x000e2900 size=0xe2900
-  stream  2: in @0x001b7fd3 len=1002385   out=+0x001c5200 size=0xe2900
-  ...
-  stream 31: in @0x014f64a4 len=575165    out=+0x01b6f700 size=0xe2900
-total decompressed = 0x1c52000 (29,696,000 bytes)
-```
-
-Every stream expands to exactly `0xE2900` (928,000) bytes; `32 × 0xE2900 = 0x1C52000`, **identical to `.winlice`'s `VirtualSize`**, and the last stream ends at `.boot` offset `0x1582BE1` against a section raw size of `0x1582C00` (19 bytes of alignment padding). A clean, complete, error-free unpack.
-
-### Stage 4 — SecureEngine (`.winlice + 0x12FD4B4`, VA `0x02FA44B4`) — **partially recovered**
-
-Execution enters heavily **mutated** x86. First instructions:
-
-```asm
-02FA44B4  55              push ebp
-02FA44B5  e9c6af0a00      jmp  0x0304F480        ; scattered basic blocks
-02FA44BA  5d              pop  ebp
-02FA44BB  e9380fd4fe      jmp  0x01CE53F8
-02FA44C0  e9c9dd0c00      jmp  0x0307228E
-...
-02FA44CD  89ef            mov  edi, ebp
-02FA44CF  81c76c000000    add  edi, 0x6C          ; context field access
-02FA44D5  8b3f            mov  edi, [edi]
-02FA44D7  be0a000000      mov  esi, 0xA
-02FA44DC  81f228000000    xor  edx, 0x28          ; junk
-02FA44E2  81c700000000    add  edi, 0             ; junk
-02FA44E8  25ffffff7f      and  eax, 0x7FFFFFFF    ; junk
-02FA44ED  0fb70f          movzx ecx, word [edi]
-...
-02FA4526  810f53c1c25c    or   dword [edi], 0x5CC2C153
-02FA456A  66310e          xor  word [esi], cx     ; in-place decryption
-```
-
-Characteristics: control-flow flattening via `jmp rel32` chains, dead arithmetic on scratch registers, and a `ebp`-relative **context structure** (fields at `+0x2C, +0x6C, +0x98, +0xB4, +0xC8, +0xD4, +0xD8`). `xor word [esi], cx` is an active decryption primitive. Static devirtualisation is out of reach (see [§24](#24-unknowns-and-limitations)).
-
-### Stage 5 — Payload activation — **inferred**
-
-Not directly observable, but required by construction:
-
-1. Decrypt/decompress payload sections 0–10 **in place** (raw ≈ 9.7 MB → virtual ≈ 24.6 MB).
-2. Apply the payload's own 1.5 MB relocation table (section 9).
-3. Resolve the payload's real imports (payload `.idata`, 23 KB) and populate them, optionally routing calls through SecureEngine API wrappers.
-4. Restore payload resources (6.8 MB) so `FindResource`/`LoadResource` work — required for VCL `.dfm` forms, which are stored as `RT_RCDATA`.
-5. Run licence / anti-tamper checks (`Software\WinLicense`, `TMLicenseA1.dat`, …).
-6. Jump to the original Delphi entry point (address unknown — it lies inside the encrypted `.text`).
-7. Delphi RTL initialises (unit `initialization` sections, `.itext`), then `Vcl.Forms.TApplication.Initialize` → `CreateForm` → `Run` → the VCL message loop.
+**Order/dependency summary:** loader → EP stub (Layer 0) → boot driver (Layer 1) → `aPLib` unpack → VM kernel (Layer 2) → decrypt/rebuild Layer 3 → OEP. Each stage bootstraps the next; nothing in Layer 2/3 is usable before Layer 1 completes, and Layer 1 is gated by Layer 0's counter reaching 3.
 
 ---
 
-## 7. Initialization Sequence Diagram / Flow
+## 7. Initialization Sequence Diagram
 
 ```mermaid
 sequenceDiagram
-    autonumber
-    participant K as Windows loader
-    participant S as Entry stub at 0x04E7D000
-    participant B as Bootstrap at 0x038F91A8
-    participant D as aPLib depacker at 0x038F905D
-    participant W as .winlice arena, RWX 28.3 MB
-    participant E as SecureEngine at 0x02FA44B4
-    participant P as Payload Delphi image
+    participant L as Windows loader
+    participant S as EP stub (.text 0x4E7D000)
+    participant D as Block driver (.boot 0x38F91A8)
+    participant A as aPLib depacker (.boot 0x38F905D)
+    participant W as .winlice (0x1CA7000, RWX)
+    participant K as VM kernel (entry 0x2FA44B4)
+    participant O as Original app (OEP, encrypted layer)
 
-    K->>K: map 21 sections, commit .winlice RWX zero-filled
-    K->>K: load 20 DLLs from .idata and fill 33 IAT slots
-    K->>K: apply manifest - ComCtl6, dpiAware, asInvoker
-    K->>K: process TLS dir at 0x0189A668, no callbacks
-    K->>K: apply 32 HIGHLOW base relocations
-    K->>S: jump to AddressOfEntryPoint
-
-    S->>S: push fake return 0x038F9058
-    loop 3 passes, counter at .data 0x04E7C079
-        S->>K: 2048x LoadLibraryA and FreeLibrary on kernel32.dll
-        S->>K: 6912x VirtualAlloc 4K and VirtualFree
-        S->>K: 13056x GetModuleHandleA NULL
+    L->>S: CreateProcess -> EIP=0x4E7D000<br/>(imports resolved, relocs applied, TLS dir, no callbacks)
+    loop 3 rounds x (2048 / 4864 / 6144 iterations)
+        S->>S: GetModuleHandleA(NULL) / LoadLibraryA("kernel32.dll")+FreeLibrary<br/>VirtualAlloc(4KB)+VirtualFree
     end
-    S->>S: 3 opaque predicates vs 0xAB4130, all false
-    S-->>B: leave then ret 0xC, transfers to 0x038F9058
-
-    B->>B: call +0x14B then pop EIP to locate self
-    B->>B: base = VA of .boot+0x58 minus 0x1C52058 = .winlice
-    B->>W: test guard dword at base+0x12FD4B4 (re-entrancy guard)
-    alt guard is zero, first run
-        B->>D: read count byte 0x20 at .boot+0x206
-        loop 32 streams
-            D->>W: aP_depack src to dst, 0xE2900 bytes
-            D-->>B: return size, ESI left at next stream
-        end
-    else guard non-zero
-        B->>B: skip decompression
+    S->>S: cmp [ebp+0xC], 0xAB4130 (normally != )
+    S-->>D: ret 0xC -> 0x38F9058 (stack pristine)<br/>call 0x38F91A8
+    D->>W: cmp dword [winlice+0x12FD4B4], 0  (fresh: 0)
+    loop 32 blocks (stream @ .boot+0x206, 22.5 MB)
+        D->>A: call depacker(src, ?, dst, ...)
+        A->>W: aPLib-decompress block -> 928,000 bytes each
     end
-    B->>E: jmp base + 0x12FD4B4, i.e. VA 0x02FA44B4
-
-    E->>E: mutated and flattened code, ebp-relative context
-    E->>W: in-place decryption via xor word ptr, cx
-    E->>P: decrypt payload sections 0 to 10 in place
-    E->>P: apply payload .reloc (1.5 MB)
-    E->>P: rebuild payload IAT (23 KB .idata)
-    E->>E: licence / anti-debug / anti-dump checks
-    E->>P: jump to original entry point, RVA unknown
-    P->>P: Delphi RTL init, .itext, VCL, message loop
+    D-->>K: jmp 0x2FA44B4 (winlice+0x12FD4B4)
+    K->>K: VM context setup; interpret encrypted bytecode
+    K->>W: decrypt VM program/handler pages as needed
+    K->>O: (inferred) decrypt original sections, rebuild imports,<br/>register bundled skeleton.dll, licensing checks, spawn guard threads
+    K-->>O: jmp OEP -> protected application active
 ```
 
-### Initialization dependency ordering
+ASCII equivalent (stage/offset map):
 
 ```
-[L0] loader: image map, DLL preload, manifest, TLS dir, relocs
-  |    (hard dependency: .winlice must be RWX-committed before L3 writes to it)
-  v
-[L1] entry stub: junk API storm, fake-return transfer
-  |    (no data dependency on L0 beyond the 14 IAT thunks it uses)
-  v
-[L2] bootstrap: self-location, guard check
-  |    (depends on: .boot mapped at its preferred RVA - no ASLR)
-  v
-[L3] aPLib x32 -> .winlice
-  |    (depends on: L2's base; destination must be writable+executable)
-  v
-[L4] SecureEngine init            <-- first point where configuration is read
-  |    (depends on: L3 complete; guard dword at +0x12FD4B4 becomes non-zero)
-  v
-[L5] payload decrypt + reloc + IAT + resources
-  |    (depends on: L4 key derivation; must precede any payload code)
-  v
-[L6] original Delphi entry point -> RTL init -> VCL -> main application active
+file 0x0000000 ─ PE headers
+file 0x0000600 ─ [S0] encrypted original program (~16.7 MB VA)      ──┐
+file 0x09D2800 ─ [S17 .boot]                                          │ Layer 3
+file 0x09D2A07 ─   22.5 MB aPLib stream (32 blocks) ──────────┐       │ (encrypted,
+file 0x1F55400 ─ [S18 .data] stub strings/tables              │       │  decrypted at
+file 0x1F55800 ─ [S19 .text] EP stub  ──────────────┐         │       │  runtime)
+file 0x1F55E58 ─ Authenticode certificate (0x2870)  │         │       │
+                                                    ▼         ▼       ▼
+   EP 0x4E7D000 ──ret 0xC──▶ 0x38F9058 ──▶ driver 0x38F91A8 ──▶ aPLib ×32 ──▶ .winlice 0x1CA7000 (29.7 MB)
+                                                                                     │
+                                                                                     ▼
+                                                              VM entry 0x2FA44B4 (.winlice+0x12FD4B4)
+                                                                                     │
+                                                                                     ▼
+                                                                      (inferred) decrypt + OEP
 ```
 
 ---
 
 ## 8. Major Components
 
-| # | Component | Location | Size | Status |
-|---|---|---|---|---|
-| C1 | **Entry stub** (`skeleton.dll` template) | `.text` VA `0x04E7D000` | 0x265 used / 0x600 | fully recovered |
-| C2 | **Stub data pool** | `.data` VA `0x04E7C000` | 1 KB | fully recovered |
-| C3 | **IAT / DLL-preload** | `.idata` RVA `0x01899000` | 1.5 KB | fully recovered |
-| C4 | **aPLib depacker** | `.boot+0x5D` VA `0x038F905D` | 0x14B bytes | fully recovered + re-implemented |
-| C5 | **Self-locating bootstrap** | `.boot+0x1A8` VA `0x038F91A8` | 0x5E bytes | fully recovered |
-| C6 | **Packed engine payload** | `.boot+0x206` | 21.5 MB → 28.3 MB | decompressed |
-| C7 | **SecureEngine runtime** | `.winlice` RVA `0x018A7000` | 28.3 MB | decompressed; code mutated |
-| C8 | **Branch-fixup table** | `.vm_sec` RVA `0x01891000` | 32 KB (3,496 B used) | fully parsed |
-| C9 | **`XBundlerTlsHelper.dll`** | `.winlice+0x56F0` | 8,704 B | fully extracted |
-| C10 | **Terminate-and-relaunch stub** | `.winlice+0x12EBA60` | 3,584 B | fully reverse-engineered |
-| C11 | **Runtime string pool** | `.winlice` ~`0x1300000`–`0x1400000` and `0x0`–`0x60000` | — | extracted |
-| C12 | **Loader-visible resources** | `.rsrc` RVA `0x0189B000` | 48 KB | fully parsed |
-| C13 | **Encrypted payload** | RVA `0x1000`–`0x188F4E8` | 24.6 MB virtual | **not recovered** |
-| C14 | **Authenticode blob** | file `0x01F55E58` | 10,352 B | fully parsed + verified |
+### 8.1 Layer 0 — entry stub (`.text` + `.data`)
 
-### C8 — `.vm_sec` branch-fixup table (fully parsed) — **confirmed**
+Described fully in §5. `.data` (0x4E7C000–0x4E7C400) contains: the round counter (`0x4E7C079`), the five `"dummy"` strings, `"kernel32.dll"`, the runtime import-resolve tables, the `skeleton.dll`/`TestHello` record, two duplicated bookkeeping tables, and the dword `0x54EC56B9` at 0x4E7C254 (build marker **[UNCERTAIN]**).
 
-`.vm_sec` is an array of 4,096 `{DWORD start; DWORD end;}` records. Analysis:
+### 8.2 Layer 1 — boot kernel (`.boot` @ VA 0x38F9000, file 0x9D2800)
 
-* **437 consecutive populated records** occupy offsets `0x000`–`0xDA8`; the table then terminates.
-* **Every** record satisfies `end − start == 5`.
-* **Every** `start` lies inside `.winlice`'s RVA range `[0x018A7000, 0x034F9000)`.
-* Reading the recovered image at each `start`: **437 / 437 begin with byte `0xE9`** (`jmp rel32`).
-* Decoding each `rel32`: **437 / 437 targets also land inside `.winlice`** (range `0x018A71AE` … `0x02C2BF75`).
-* 685 delta-5 pairs exist in the section overall; the remainder of the 32 KB is mostly zeros (15,721 zero bytes in the 29 KB tail) — spare capacity.
+Two functions were fully recovered:
 
-Sample records:
-
-| `start` (RVA) | `.winlice` offset | Bytes | Decoded |
-|---|---|---|---|
-| `018AFAE0` | `0x8AE0` | `E9 17 AA 02 00` | `jmp 0x01CDA4FC` |
-| `018AF926` | `0x8926` | `E9 83 87 02 00` | `jmp 0x01CD80AE` |
-| `018E094A` | `0x3994A` | `E9 BF E5 FE FF` | `jmp 0x01CCEF0E` |
-| `018E9A14` | `0x42A14` | `E9 E7 55 01 00` | `jmp 0x01CFF000` |
-
-**Interpretation (strongly inferred):** a registry of 5-byte `jmp rel32` trampolines inside the decompressed engine that SecureEngine can re-target, re-encrypt, verify, or hook at runtime — the mechanism behind per-run code layout randomisation / integrity self-checking. The measurements above are confirmed; the *purpose* is inference.
-
-### C9 — `XBundlerTlsHelper.dll` — **confirmed**
-
-Recovered from `.winlice+0x56F0` (8,704 bytes; `MZ`/`PE` validated by `pefile`).
-
-| Property | Value |
-|---|---|
-| Machine / type | i386 **DLL** (`Characteristics = 0x2102`) |
-| `ImageBase` | `0x10000000` |
-| Build timestamp | 2022-12-22 11:57:28 UTC |
-| Imports | `KERNEL32.dll!Sleep` (one function only) |
-| Sections | `.text`(0x34) `.rdata`(0x2D6) `.data`(8) **`.tls`(0x1009)** `.CRT`(8) `.rsrc`(0x1E0) `.reloc`(0x24) |
-| TLS directory | raw `0x10004000`–`0x10005008`, index `0x10003004`, **callbacks `0x10006004` (array is all zeros)** |
-| PDB path | `Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb` |
-| Manifest | inline `asInvoker`, `uiAccess=false` |
-| Linker artefacts | `.text$mn`, `.idata$2..$6`, `.rdata$T`, `.rdata$zzzdbg`, `.tls$ZZZ`, `.CRT$XLA`, `.CRT$XLZ` → **MSVC-built** |
-
-Complete `DllMain`:
+**`sub_38F91A8` — multi-block unpack driver [CONFIRMED]**
 
 ```asm
-10001000  push ebp
-10001001  mov  ebp, esp
-10001003  mov  eax, [ebp+0x0C]          ; fdwReason
-10001006  cmp  eax, 3
-10001009  ja   0x1000101A
-1000100B  jmp  dword [eax*4 + 0x10001024]   ; jump table
-;   table: [0]=0x1000101A  [1]=0x10001012  [2]=0x1000101A  [3]=0x1000101A
-10001012  push 1
-10001014  call dword [0x10002000]       ; Sleep(1)      <- DLL_PROCESS_ATTACH only
-1000101A  mov  eax, 1
-1000101F  pop  ebp
-10001020  ret  0x0C                     ; return TRUE
+38F91A8  pop  eax                      ; eax = return address = 0x38F905D
+         push ebx,ecx,edx,esi,edi,ebp  ; (push sequence in original order)
+         mov  ebx, eax
+         sub  ebx, 5                   ; 0x38F9058
+         sub  ebx, 0x1C52058           ; -> EBX = 0x1CA7000  (.winlice base)
+         push eax
+         mov  eax, 0x12FD4B4
+         add  eax, ebx                 ; flag/entry address
+         cmp  dword [eax], 0
+         jne  38F91F7                  ; already unpacked -> skip to jmp
+         ...
+38F91CC  mov  ecx, 0x1AE
+38F91D1  sub  ecx, 5
+38F91D4  add  ecx, eax                 ; ecx = 0x38F905D + 0x1A9 = 0x38F9206 = packed stream
+38F91D7  mov  esi, ecx                 ; source cursor
+38F91D9  mov  edi, ebx                 ; dest cursor = .winlice
+38F91DB  mov  cl, [esi]                ; block count = 0x20 (32)
+38F91DE  inc  esi
+block:  push ecx / push eax / push edi / push 0 / push edi / push 0 / push esi
+38F91EB  call eax                      ; call sub_38F905D (aPLib depacker)
+38F91ED  pop  edi
+38F91EE  add  edi, eax                 ; dest += unpacked size
+38F91F0  pop  eax
+38F91F1  pop  ecx
+38F91F2  dec  cl
+38F91F4  jnz  block
+38F91F7  mov  eax, 0x12FD4B4
+38F91FC  add  eax, ebx
+         pop ebp/edi/esi/edx/ecx/ebx
+38F9204  jmp  eax                      ; -> 0x2FA44B4
 ```
 
-`DllMain` is a no-op apart from `Sleep(1)`. The DLL's real value is its **`.tls` section** — 0x1009 bytes of zeroed thread-local storage plus a complete, well-formed `IMAGE_TLS_DIRECTORY`. Oreans' **XBundler** feature bundles DLLs inside a protected executable and maps them manually; manually-mapped DLLs never get TLS set up by the Windows loader. This DLL is the *template* that supplies a real, loader-registered TLS block and callback array for bundled modules to borrow. — **confirmed** (artefact, code), **strongly inferred** (purpose).
+**`sub_38F905D` — aPLib depacker [CONFIRMED]**
 
-### C10 — Terminate-and-relaunch stub — **confirmed, fully reverse-engineered**
+A textbook **aPLib 1.1.1 "safe depacker"** (ibsen software): bit-tag driven LZ77 with gamma2-coded offsets/lengths. Fingerprint constants visible in the code: offset thresholds `0x7D00` (32000), `0x500` (1280), `0x7F` (128) for length adjustment — the aPLib specification values. Verified empirically: applying a pure-Python aPLib depacker to the 32 streams **decompressed every block cleanly, each producing exactly 928,000 (0xE2900) bytes**:
 
-Recovered from `.winlice+0x12EBA60` (3,584 bytes).
+* stream: file **0x9D2A07 – 0x1F55360** (22,554,970 bytes of the 22,575,104-byte `.boot` section; the remainder is the driver/`aPLib` code at the section head plus padding),
+* output: **29,696,000 bytes (0x1C52000) = exactly the `.winlice` virtual size** — 32 blocks × 928,000.
+* SHA-256 of the reconstructed `.winlice` image: `240247194afc4c29f88e9525ed1915c80ef8b9bdee33a1913958fe6b07d99b51`.
 
-| Property | Value |
-|---|---|
-| Type | i386 **EXE**, `ImageBase 0x00400000`, EP RVA `0x1000`, GUI subsystem |
-| Build timestamp | 2007-03-07 07:23:02 UTC (long-lived Oreans helper) |
-| Imports | `KERNEL32`: `CreateProcessA`, `ExitProcess`, `GetCommandLineA`, `GetStartupInfoA`, `OpenProcess`, `Sleep`, `TerminateProcess` |
-| Sections | `.text`(0x220) `.rdata`(0xE4) `.data`(0x266) |
-| Code style | hand-written assembly (`pushal`/`popal`, `scasb`, `movsb`, no CRT) |
+### 8.3 Layer 2 — SecureEngine kernel / VM (`.winlice` image)
 
-Full behaviour is reconstructed in [§13.3](#133-terminate-and-relaunch-stub--fully-reconstructed).
+Content map of the unpacked 29,696,000-byte image (offsets relative to VA 0x1CA7000; classification by entropy profiling + disassembly sampling **[CONFIRMED structure, inferred labeling]**)：
+
+| Offset range | Entropy | Content |
+|---|---|---|
+| +0x000000–+0x060000 | 5.1–6.3 | **VM interpreter + handlers** — dense x86 with the dispatch idiom below |
+| +0x060000–+0x280000 | ≈ 7.98 | **Encrypted VM program** (protection logic bytecode) |
+| +0x1200000–+0x13F0000 | 4.5–6.3 | More interpreter/handler code, structured data, **embedded restart-helper EXE at +0x12EBA60** |
+| +0x1A00000–+0x1C20000 | ≈ 5.9 | Structured native code/data (kernel modules) |
+| +0x1C20000–+0x1C52000 | ≈ 7.99 | Second encrypted blob |
+| +0x00056F0 | — | **Embedded DLL: `XBundlerTlsHelper`** (§8.4) |
+
+**VM dispatch idiom [CONFIRMED — repeatedly observed at +0x0 and around +0x12FD4B4/0x2FA4xxx]:**
+
+```asm
+; EBP = VM context record
+mov  ebx, ebp
+add  ebx, 0x84
+mov  ebx, [ebx]          ; ctx.instr_ptr
+add  ebx, 6
+mov  dx, [ebx]           ; fetch encoded word from bytecode stream
+xor  edx, [ebp+4]        ; decode with key register
+add  edx, [ebp+0x54]
+xor  [ebp+4], edx        ; evolve key state
+and  dword [ebp+0x20], 0x0C6D2D77      ; churn state registers
+...
+mov  ebx, [ebp+0x84]     ; instr_ptr
+add  ebx, 0xA
+movzx ebx, word [ebx]    ; second encoded field
+add  ebx, [ebp+4]
+and  ebx, 0xFFFF
+shl  ebx, 2
+mov  ecx, [ebp+0x38]     ; handler/dispatch table base
+add  ecx, ebx
+mov  edx, [ecx]          ; handler address
+mov  esi, [ebp+0x84]
+mov  ecx, [esi]          ; advance instruction pointer by embedded delta
+add  [ebp+0x84], ecx
+jmp  edx                 ; dispatch
+```
+
+Every VM instruction is fetched through an encoded pointer, decrypted (XOR/add with evolving key state), masked to 16 bits, doubled, and used to index a handler table at `ctx+0x38`; the instruction pointer advances by deltas read from the stream; EFLAGS are occasionally captured via `pushfd`/restored into context slots (anti-emulation). This is the documented architecture of the Themida/WinLicense **code-virtualization engine**. **[mechanics CONFIRMED; "T32E/Themida VM" naming STRONGLY INFERRED]**
+
+### 8.4 Embedded PE #1 — `XBundlerTlsHelper` DLL **[CONFIRMED]**
+
+Found at unpacked offset **+0x56F0** (file-equivalent bytes start `4D 5A 90 00…`), fully carved and parsed (8,704 bytes):
+
+* PE32 i386 **DLL**, ImageBase 0x10000000, 7 sections (`.text .rdata .data .tls .CRT .rsrc .reloc`), TimeDateStamp **2022-12-22 11:57:28 UTC**, `DYNAMIC_BASE|NX_COMPAT|NO_SEH`.
+* **CodeView PDB path:** `Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb` — direct confirmation of the **SecureEngine** project and the **XBundler embedded-DLL plugin**.
+* Imports: **`KERNEL32.dll!Sleep` only**.
+* `DllMain` (0x10001000): `switch(fdwReason)` via jump table `[0x1000101A, 0x10001012, 0x1000101A, 0x1000101A]` — only `DLL_PROCESS_ATTACH` (1) does anything: **`Sleep(1); return TRUE;`**. All other reasons return TRUE.
+* TLS directory present (template 0x1008 bytes, **callbacks array empty**), embedded `asInvoker` manifest.
+* SHA-256 (carved): `de0aa79373299d38e79f5895530c54d43970c18867212ee171580e5e28dca5eb`.
+
+Function: a placeholder/TLS-support DLL that the kernel registers when the protected application uses **bundled (embedded) DLLs** — matching the `skeleton.dll`/`TestHello` record in `.data` (§4.3). **[STRONGLY INFERRED]**
+
+### 8.5 Embedded PE #2 — process-restart helper EXE **[CONFIRMED — fully reversed]**
+
+Found at unpacked offset **+0x12EBA60** (3,584 bytes):
+
+* PE32 i386 EXE, ImageBase 0x400000, 3 sections, TimeDateStamp **2007-03-07 07:23:02 UTC** (an Oreans helper apparently unchanged since 2007).
+* Imports: `ExitProcess, GetCommandLineA, GetStartupInfoA, OpenProcess, Sleep, TerminateProcess, CreateProcessA` (KERNEL32).
+* SHA-256 (carved): `86ffd39f8c53924a25935a4e1667487c2a63c7c8313e4d4f6bb13a9ac742db3b`.
+
+Complete recovered logic (§13.4): invoked as `helper.exe "<PID>" "<program>" ["<args>"]` — it terminates the given PID, sleeps ~1–2 s, and re-launches the program with `CreateProcessA` (`NORMAL_PRIORITY_CLASS|CREATE_NEW_CONSOLE`, `STARTF_USESHOWWINDOW/SW_SHOWNORMAL`), then exits. Such helpers are used by the protector to restart the process after license/self-modification steps. **[logic CONFIRMED; who invokes it and when: STRONGLY INFERRED]**
+
+### 8.6 `.vm_sec` — jump-bridge slot registry **[CONFIRMED structure; purpose STRONGLY INFERRED — fully characterized in §27.5]**
+
+The 32 KB RW section contains dword-pair records. The meaningful 0x61D0 bytes hold **685 (X, X+5) pairs in two contiguous runs** (entries 0–436 and 1903–2150), where X is an RVA into `.winlice` and — **verified for all 685** — points at an `E9` (`jmp rel32`) opcode in the unpacked kernel: each pair registers **two consecutive 5-byte jump slots** of the kernel's threaded trampoline arrays. Jump targets distribute 243 → interpreter/bridge area (+0–0x100000), 65 → +0x1200000 block, 377 → +0x1300000 VM-handler/licensing block. The remaining 1452 nonzero records are a different (possibly encrypted) record type **[UNKNOWN]**. The section is data, not code, despite superficially disassembling like code.
+
+### 8.7 Encrypted original-program sections (Layer 3)
+
+Sections 0–10 (§2.2) — ~16.7 MB VA / ~5.9 MB raw at entropy 7.98 — hold the original program's code/data, encrypted. Their RVAs (0x1000, 0xFFD000, 0x1007000, .bss, .tls at 0x103E000, …) mirror a normal Delphi/Win32 image layout, supporting the "original layout preserved, content encrypted" model. **[STRONGLY INFERRED]**
 
 ---
 
 ## 9. Functions and Important Symbols
 
-### 9.1 Recovered functions — protector bootstrap
+All addresses below are CONFIRMED by disassembly.
 
-| Address (VA) | Name (assigned) | Signature / role | Confidence |
-|---|---|---|---|
-| `0x04E7D000` | `StubEntry` | PE entry point; `DllMain`-shaped; transfers via faked return | confirmed |
-| `0x04E7D170` | `dead_MessageBox_block` | unreferenced `MessageBoxA(0,"dummy","dummy",0)` | confirmed |
-| `0x04E7D1E8`–`0x04E7D20B` | `ImportAnchor` | 8 `call`s referencing IAT thunks so the linker retains them | confirmed |
-| `0x04E7D211` | `thunk_FreeLibrary` | `jmp [0x01C994FC]` | confirmed |
-| `0x04E7D217` | `thunk_GetCommandLineA` | `jmp [0x01C994F4]` | confirmed |
-| `0x04E7D21D` | `thunk_GetCurrentThreadId` | `jmp [0x01C994F0]` | confirmed |
-| `0x04E7D223` | `thunk_GetModuleHandleA` | `jmp [0x01C994D0]` | confirmed |
-| `0x04E7D229` | `thunk_GetProcessHeap` | `jmp [0x01C994D4]` | confirmed |
-| `0x04E7D22F` | `thunk_GetVersionExA` | `jmp [0x01C994D8]` | confirmed |
-| `0x04E7D235` | `thunk_HeapAlloc` | `jmp [0x01C994DC]` | confirmed |
-| `0x04E7D23B` | `thunk_HeapFree` | `jmp [0x01C994F8]` | confirmed |
-| `0x04E7D241` | `thunk_LoadLibraryA` | `jmp [0x01C994E4]` | confirmed |
-| `0x04E7D247` | `thunk_VirtualAlloc` | `jmp [0x01C994E8]` | confirmed |
-| `0x04E7D24D` | `thunk_VirtualFree` | `jmp [0x01C994EC]` | confirmed |
-| `0x04E7D253` | `thunk_MessageBoxA` | `jmp [0x01C99518]` | confirmed |
-| `0x04E7D259` | `thunk_ImmSetCompositionWindow` | `jmp [0x01C9959C]` | confirmed |
-| `0x04E7D25F` | `thunk_ImageList_EndDrag` | `jmp [0x01C99554]` | confirmed |
-| `0x038F9058` | `BootTrampoline` | `call BootMain` | confirmed |
-| `0x038F905D` | **`aP_depack`** | `size_t(src, _, dst, _, _)`, `__stdcall`-ish, `ret 0x10`; leaves `ESI` past the stream | confirmed |
-| `0x038F91A8` | **`BootMain`** | locates self, checks guard, drives 32 depack calls, jumps to engine | confirmed |
-| `0x02FA44B4` | `SecureEngineEntry` | mutated engine entry | confirmed (address), opaque (body) |
+**Layer 0 (`0x4E7D000` stub):**
 
-### 9.2 Recovered functions — terminate-and-relaunch stub
-
-| Address | Name | Role | Confidence |
-|---|---|---|---|
-| `0x00401000` | `main` | parse cmdline → kill PID → relaunch | confirmed |
-| `0x0040114D` | `extract_quoted(dst, src)` | copy text between the next `"…"`; returns `src` past the closing quote | confirmed |
-| `0x00401177` | `str_equal(a, b)` | returns 1 if equal, 0 otherwise — **unreferenced** in the recovered flow | confirmed |
-| `0x004011A9` | `atoi_signed(s)` | decimal parse; negates when the first char is `< 0x2E` | confirmed |
-| `0x004011D7` | `strcat(dst, src)` | append | confirmed |
-| `0x004011F6`…`0x0040121A` | IAT thunks | `CreateProcessA`, `ExitProcess`, `GetCommandLineA`, `GetStartupInfoA`, `OpenProcess`, `Sleep`, `TerminateProcess` | confirmed |
-
-### 9.3 Recovered functions — XBundlerTlsHelper.dll
-
-| Address | Name | Role | Confidence |
-|---|---|---|---|
-| `0x10001000` | `DllMain` | jump table on `fdwReason`; `Sleep(1)` on `DLL_PROCESS_ATTACH`; returns TRUE | confirmed |
-
-### 9.4 Payload symbols (from the copied export table) — **confirmed**
-
-| RVA | Symbol | Source |
+| Address | Symbol (assigned) | Purpose |
 |---|---|---|
-| `0x000DEB70` | `TMethodImplementationIntercept` | Delphi `System.Rtti` |
-| `0x00012660` | `__dbk_fcall_wrapper` | Delphi debug kernel |
-| `0x0102F5AC` | `dbkFCallWrapperAddr` | Delphi debug kernel (data) |
-| `0x000B0CBC` | `madTraceProcess` | **madExcept** |
+| 0x4E7D000 | `stub_entry` | EP: trampoline + warm-up + magic check + `ret 0xC` into boot |
+| 0x4E7D01F–0x4E7D08E | `warmup_pass_A` | 2,048 × (GMA/LLA/FL/VA/VF) |
+| 0x4E7D090–0x4E7D0CB | `warmup_pass_B` | 4,864 × (GMA/VA/VF) |
+| 0x4E7D0CD–0x4E7D0E8 | `warmup_pass_C` | 6,144 × GMA |
+| 0x4E7D0F0 | `round_gate` | `cmp [0x4E7C079],3` |
+| 0x4E7D0FD–0x4E7D155 | `dummy_msgbox_chain` | 3× `cmp [ebp+0xC],0xAB4130` → MessageBox |
+| 0x4E7D15E–0x4E7D210 | `decoy_block` | MessageBox + constant soup + 8 bogus calls + `int3` |
+| 0x4E7D211–0x4E7D25F | `thunk_table` | 12 `jmp [IAT]` stubs |
 
-### 9.5 Named engine identifiers recovered from `.winlice` — **confirmed**
+**Layer 1 (`.boot`):**
 
-Counters / state markers: `CheckIN`, `CheckOUT`, `ProcIN`, `ProcOUT`, `ExitIN`, `ExitOUT`, `ExitOk`, `XprotExit`, `TpIN`, `HWIN`, `ExpInfo`, `SplashClassName`.
+| Address | Symbol | Purpose |
+|---|---|---|
+| 0x38F9058 | `boot_entry` | `call 0x38F91A8` |
+| 0x38F905D | `aPLib_depack(src, ?, dst, …)` | aPLib 1.1.1 depacker; returns unpacked size; `ret 0x10` |
+| 0x38F91A8 | `block_driver` | self-locating 32-block unpack loop + `jmp` into VM entry |
+| 0x38F9206 | `packed_stream` | `[count=32][aPLib block]×32` (file 0x9D2A07) |
 
-Configuration keys: `WLProjectName`, `WLSoftwareName`, `WLSoftwareVersion`, `WLProtectionDateTime`, `WinLicenseVersion`, `WinLicenseDriverVersion`, `WinLicenseInstance`.
+**Layer 2 (`.winlice` @ 0x1CA7000):**
 
-Build artefacts: `skeleton.dll`, `TestHello`, `?2ndwsdk`, `XBundlerTlsHelper.pdb`.
+| Address | Symbol | Purpose |
+|---|---|---|
+| 0x1CA7000 | `vm_interpreter_body` | EBP-context VM fetch/decode/dispatch loop |
+| **0x2FA44B4** | `vm_entry` (= `.winlice+0x12FD4B4`) | kernel entry point; **also the "already unpacked" flag probed by the driver**; first bytes `55 E9 …` |
+| +0x56F0 (VA 0x1CAC6F0) | embedded `XBundlerTlsHelper.dll` | §8.4; `DllMain` at DLL+0x1000: `Sleep(1)` on attach |
+| +0x12EBA60 | embedded restart-helper EXE | §8.5; functions below |
+
+**Embedded restart helper (base 0x400000):**
+
+| Address | Symbol | Purpose |
+|---|---|---|
+| 0x401000 | `main` | cmdline parse → kill → sleep → respawn → exit |
+| 0x40114D | `extract_quoted(dst, src)` | copy text between the next pair of `"`; returns ptr past closing quote |
+| 0x401177 | `compare(s1, s2)` | byte compare; returns 0 while equal (unused in main flow) |
+| 0x4011A9 | `atoi(s)` | compact ×10 digit accumulator |
+| 0x4011D7 | `append(dst, src)` | `strcat`-like: strlen(dst) then copy |
+| 0x4011F6–0x40121A | import thunks | CreateProcessA/ExitProcess/GetCommandLineA/GetStartupInfoA/OpenProcess/Sleep/TerminateProcess |
+| 0x403000 / 0x403044 / 0x403054 / 0x403153 / 0x40315D / 0x403161 / 0x403264 | data buffers | STARTUPINFO / PROCESS_INFORMATION / cmd-line buffer / PID string / PID / 3rd token / `" "` separator |
+
+**Exports (original program's, preserved):** `dbkFCallWrapperAddr` (0x142F5AC), `__dbk_fcall_wrapper` (0x412660), `madTraceProcess` (0x4B0CBC), `TMethodImplementationIntercept` (0x4DEB70) — Delphi/madExcept integration. **[CONFIRMED]**
+
+No other symbols exist — the image is stripped (no debug directory, no exports beyond the four above).
 
 ---
 
 ## 10. Data Structures
 
-### 10.1 `.boot` layout — **confirmed**
-
-```c
-struct BootSection {                      /* RVA 0x034F9000, 0x1582C00 bytes */
-/* +0x0000 */ uint8_t  magic_or_key[0x28];   /* 40 random-looking bytes      */
-/* +0x0028 */ uint8_t  zero_pad[0x30];       /* zeros up to +0x58            */
-/* +0x0058 */ uint8_t  trampoline[5];        /* E8 4B 01 00 00 -> +0x1A8     */
-/* +0x005D */ uint8_t  aP_depack[0x14B];     /* inlined aPLib depacker       */
-/* +0x01A8 */ uint8_t  boot_main[0x5E];      /* self-locating driver         */
-/* +0x0206 */ uint8_t  stream_count;         /* 0x20 = 32                    */
-/* +0x0207 */ uint8_t  streams[];            /* 32 concatenated aPLib blobs  */
-};                                           /* last stream ends at 0x1582BE1*/
-```
-
-### 10.2 `.vm_sec` record — **confirmed**
-
-```c
-struct BranchFixup {          /* .vm_sec, RVA 0x01891000, 4096 slots */
-    uint32_t start_rva;       /* points at an E9 jmp rel32 in .winlice */
-    uint32_t end_rva;         /* always start_rva + 5                  */
-};                            /* 437 contiguous valid records at +0x000..+0xDA8 */
-```
-
-### 10.3 Entry-stub `.data` = the verbatim import section of `skeleton.dll` — **confirmed**
-
-`.data` (VA `0x04E7C000`, 1 KB) is not ad-hoc scratch space: it is the **complete, unmodified `.rdata`/import section of the Oreans `skeleton.dll` template project**, carried into the host image. Every internal pointer is consistent with a base of **RVA `0x2000`**, i.e. `.data offset X` ↔ `skeleton.dll RVA 0x2000 + X`. This was verified by resolving all four `IMAGE_IMPORT_DESCRIPTOR` `Name` fields back to real strings.
+### 10.1 Bootstrap frame (Layer 0) **[CONFIRMED]**
 
 ```
-/* ---- FirstThunk (IAT) arrays --------------------------------- */
-+0x000 (RVA 0x2000)  COMCTL32 IAT : 0x222A -> "ImageList_EndDrag",      0 terminator
-+0x008 (RVA 0x2008)  IMM32    IAT : 0x2206 -> "ImmSetCompositionWindow",0 terminator
-+0x010 (RVA 0x2010)  KERNEL32 IAT : 0x2176 0x2188 0x2198 0x2162 0x21B0 0x21C0
-                                    0x21D0 0x214C 0x213A 0x21A4 0x212C, 0 terminator
-+0x040 (RVA 0x2040)  USER32   IAT : 0x21EC -> "MessageBoxA",            0 terminator
-
-/* ---- template literals --------------------------------------- */
-+0x048  "dummy"  +0x04E "dummy"  +0x054 "dummy"
-+0x05A  "dummy"  +0x060 "dummy"  +0x066 "dummy"      <- MessageBoxA args (dead code)
-+0x06C  "kernel32.dll"                               <- LoadLibraryA arg in the junk loop
-+0x079  DWORD outer_loop_counter                     <- inc @04E7D0EA, cmp vs 3 @04E7D0F0
-
-/* ---- IMAGE_IMPORT_DESCRIPTOR array (4 entries + terminator) --- */
-+0x080  OFT=0x20F4  Name=0x21DE "KERNEL32.dll"  FT=0x2010
-+0x094  OFT=0x2124  Name=0x21FA "USER32.dll"    FT=0x2040
-+0x0A8  OFT=0x20EC  Name=0x2220 "IMM32.dll"     FT=0x2008
-+0x0BC  OFT=0x20E4  Name=0x223E "COMCTL32.dll"  FT=0x2000
-+0x0D0  all-zero terminator
-
-/* ---- OriginalFirstThunk (ILT) arrays: same values as the IATs -- */
-+0x0E4 (RVA 0x20E4)  COMCTL32 ILT     +0x0EC (RVA 0x20EC) IMM32 ILT
-+0x0F4 (RVA 0x20F4)  KERNEL32 ILT     +0x124 (RVA 0x2124) USER32 ILT
-
-/* ---- IMAGE_IMPORT_BY_NAME pool (2-byte hint + name) ----------- */
-+0x12C hint  +0x12E "FreeLibrary"           +0x13A hint +0x13C "GetCommandLineA"
-+0x14C hint  +0x14E "GetCurrentThreadId"    +0x162 hint +0x164 "GetModuleHandleA"
-+0x176 hint  +0x178 "GetProcessHeap"        +0x188 hint +0x18A "GetVersionExA"
-+0x198 hint  +0x19A "HeapAlloc"             +0x1A4 hint +0x1A6 "HeapFree"
-+0x1B0 hint  +0x1B2 "LoadLibraryA"          +0x1C0 hint +0x1C2 "VirtualAlloc"
-+0x1D0 hint  +0x1D2 "VirtualFree"
-+0x1DE "KERNEL32.dll"
-+0x1EC hint  +0x1EE "MessageBoxA"           +0x1FA "USER32.dll"
-+0x206 hint  +0x208 "ImmSetCompositionWindow"   +0x220 "IMM32.dll"
-+0x22A hint  +0x22C "ImageList_EndDrag"         +0x23E "COMCTL32.dll"
-
-/* ---- export metadata of the template module ------------------- */
-+0x282  "skeleton.dll"      <- export directory Name
-+0x28F  "TestHello"         <- exported function name
+entry ESP:  [ret_loader][loader dword][loader dword][loader dword]...
+stub pushes v3,v2,v1 (copies of the three loader dwords), 0x38F9058, ebp
+[ebp+0x04] = 0x38F9058   (forged return -> boot)
+[ebp+0x08] = v1 = entry_[esp+0xC]
+[ebp+0x0C] = v2 = entry_[esp+0x8]   <- compared against 0xAB4130
+[ebp+0x10] = v3 = entry_[esp+0x4]
 ```
 
-Every hint/name RVA in the thunk arrays resolves to `0x2000 + offset` of a real string in this table (e.g. `0x212C + 2 = 0x212E` → `.data+0x12E` = `"FreeLibrary"`), which is what proves the base-RVA relationship. The `skeleton.dll` template therefore genuinely imported 11 `kernel32` functions plus `MessageBoxA`, `ImmSetCompositionWindow` and `ImageList_EndDrag` — exactly the 14 thunks present at `0x04E7D211`–`0x04E7D264`. The other 18 DLLs in the host's `.idata` were added by the protection step purely as preload hints ([§4.1](#41-import-table--confirmed-structure-strongly-inferred-purpose)).
-
-### 10.4 TLS directory (protector-relocated) — **confirmed**
-
-```c
-IMAGE_TLS_DIRECTORY32 @ RVA 0x0189A668 {
-    StartAddressOfRawData = 0x01C9A000,   /* VA; RVA 0x0189A000          */
-    EndAddressOfRawData   = 0x01C9A654,   /* length 0x654                */
-    AddressOfIndex        = 0x01C9A658,
-    AddressOfCallBacks    = 0x00000000,   /* NO TLS CALLBACKS            */
-    SizeOfZeroFill        = 0,
-    Characteristics       = 0
-};
-```
-
-`0x654` is exactly the virtual size of the original payload `.tls` section (RVA `0x0103E000`). The raw block is entirely zero (only 11 non-zero bytes exist in the whole 2 KB section — the three relocated pointers). Delphi `threadvar` storage is zero-initialised, so this is a faithful relocation of the payload's TLS template.
-
-### 10.5 SecureEngine context (partial) — **uncertain**
-
-The mutated engine addresses an `ebp`-relative structure. Confirmed touched offsets: `+0x2C`, `+0x6C` (pointer, dereferenced), `+0x98`, `+0xB4` (byte, compared against `0xFA`), `+0xC8` (DWORD, used as an XOR key), `+0xD4` (OR-ed with `0x5CC2C153`), `+0xD8` (WORD, XOR-decrypted). Field semantics are unknown.
-
-### 10.6 Restarter stub globals — **confirmed**
+### 10.2 Packed-stream container **[CONFIRMED]**
 
 ```
-0x00403000  STARTUPINFOA si;          /* 0x44 bytes */
-0x00403044  PROCESS_INFORMATION pi;   /* 0x10 bytes */
-0x00403054  char cmd[0xFF];           /* token 2 (+ " " + token 3)   */
-0x00403153  char pid_text[0x0A];      /* token 1, decimal PID        */
-0x0040315D  DWORD pid;                /* atoi(pid_text)              */
-0x00403161  char args[0x103];         /* token 3                     */
-0x00403264  char SPACE[2] = " ";      /* separator literal           */
+offset 0x00: BYTE  block_count = 32
+offset 0x01: aPLib stream #1  -> 928,000 bytes
+             aPLib stream #2  -> 928,000 bytes
+             ... (32 total; consumed sequentially, no separators)
+```
+
+### 10.3 VM context record (EBP-relative, partial map) **[CONFIRMED offsets from disassembly; field semantics INFERRED]**
+
+| Offset | Observed use |
+|---|---|
+| +0x04 | key register — XOR-evolved with decoded fields |
+| +0x14, +0x1C, +0x20, +0x2C | 16/32-bit state registers (add/sub/and with immediate constants) |
+| +0x38 | **dispatch/handler table base** (`target = [[ctx+0x38] + idx*4]`) |
+| +0x54 | key/state addend |
+| +0x6C | secondary stream pointer (fields at +0,+4,+6,+8,+0xA,+0xC read through it) |
+| +0x78 | byte tag — compared `<= 0x0C`, `<= 0xD4`, `<= 0x22` (opcode class checks) |
+| +0x84 | **instruction pointer** — word fields fetched at +0,+2,+4,+6,+8,+0xA,+0xC; advanced by dword deltas |
+| +0x98, +0xB0, +0xC8, +0xD4, +0xD8, +0xDC | general VM registers / spill slots (incl. an EFLAGS spill via `pushfd`) |
+
+*Refined by the 685-handler read/write census in §28.1 (e.g. +0xC8/+0xD4/+0xD8 are the rolling key/state fields updated by ~390 handlers; +0x38 is read-only in handlers — the dispatch-table pointer; +0x6C and +0x84 are the two level-dependent fetch pointers).*
+
+### 10.4 TLS directory **[CONFIRMED]**
+
+```
+StartAddressOfRawData = 0x1C9A000   EndAddressOfRawData = 0x1C9A654   (0x654 zero bytes template)
+AddressOfIndex        = 0x1C9A658   AddressOfCallBacks  = 0x0  (NO callbacks)
+SizeOfZeroFill = 0   Characteristics = 0x400000
+```
+The raw `.tls` template on disk is all zeros (the only non-zero bytes in the section are the directory structure itself). The kernel presumably populates TLS data at runtime. **[first part CONFIRMED; second INFERRED]**
+
+### 10.5 `.vm_sec` entry **[CONFIRMED]**
+
+```
+struct vmsec_entry { uint32 rva_start; uint32 rva_end; };  // end = start + 5, values within .winlice RVA range
+```
+
+### 10.6 Authenticode blob **[CONFIRMED]** — see §2.4 (WIN_CERTIFICATE + PKCS#7/CMS with 5 certs + RFC-3161 timestamp).
+
+### 10.7 `.data` layout (Layer 0) **[CONFIRMED]**
+
+```
+0x4E7C000 / 0x4E7C0E0  two identical 14-dword tables (values 0x212C..0x222A)   [purpose UNCERTAIN]
+0x4E7C040  dword 0x21EC, 0
+0x4E7C048  "dummy\0"  x5  (0x4E7C048/04E/054/05A/060)
+0x4E7C066  "kernel32.dll\0"
+0x4E7C079  DWORD round counter (0 -> 3)
+0x4E7C128  hint/name records: FreeLibrary, GetCommandLineA, GetCurrentThreadId,
+           GetModuleHandleA, GetProcessHeap, GetVersionExA, HeapAlloc, HeapFree,
+           LoadLibraryA, VirtualAlloc, VirtualFree | MessageBoxA/USER32.dll |
+           ImmSetCompositionWindow/IMM32.dll | ImageList_EndDrag/COMCTL32.dll
+0x4E7C254  dword 0x54EC56B9 (marker)                                          [UNCERTAIN]
+0x4E7C258  table: 1,1,1,0x2278,0x227C,0x2280,0x1147,0x228F                     [UNCERTAIN]
+0x4E7C288  "skeleton.dll\0"   0x4E7C296 "TestHello\0"   (bundled-file record)
 ```
 
 ---
 
 ## 11. Runtime State and Control Flow
 
-### 11.1 Global protector state machine — **confirmed for S0–S4**
+Observable/derivable state transitions:
 
 ```mermaid
 stateDiagram-v2
-    [*] --> S0_Loaded : CreateProcess
-    S0_Loaded : Image mapped, 20 DLLs preloaded, 32 relocs applied
-    S0_Loaded --> S1_Stub : jmp AddressOfEntryPoint
-
-    S1_Stub : Junk counter at 0x04E7C079 starts at zero
-    S1_Stub --> S1_Stub : junk pass, counter below 3
-    S1_Stub --> S2_Boot : counter reaches 3, then leave and ret 0xC
-
-    S2_Boot : Self-located, base resolved to .winlice
-    S2_Boot --> S3_Unpack : guard dword is zero
-    S2_Boot --> S4_Engine : guard non-zero, already unpacked
-
-    S3_Unpack : 32 aPLib streams totalling 0x1C52000 bytes
-    S3_Unpack --> S4_Engine : jmp base plus 0x12FD4B4
-
-    S4_Engine : Mutated SecureEngine executing
-    S4_Engine --> S5_Decrypt : derive keys
-    S5_Decrypt : Payload decrypted in place, reloc, IAT, resources
-    S5_Decrypt --> S6_Payload : jmp original entry point
-    S5_Decrypt --> S7_Fail : integrity, licence or environment failure
-
-    S6_Payload : Delphi RTL then VCL message loop, ACTIVE
-    S6_Payload --> [*] : normal exit
-    S7_Fail : Bug-check dialog, restart stub, or terminate
-    S7_Fail --> [*]
+    [*] --> Mapped: loader (imports+relocs, .winlice zeroed)
+    Mapped --> WarmUp: EIP = 0x4E7D000
+    state WarmUp {
+        [*] -> Round1
+        Round1 -> Round2: counter=1
+        Round2 -> Round3: counter=2
+        Round3 -> Done3: counter=3
+    }
+    WarmUp --> BootUnpack: ret 0xC -> 0x38F9058
+    BootUnpack --> KernelActive: 32 aPLib blocks -> .winlice\nflag[0x2FA44B4] becomes non-zero
+    KernelActive --> AppActive: (inferred) decrypt Layer3, rebuild imports, jmp OEP
+    AppActive --> [*]
 ```
 
-The **re-entrancy guard** (`cmp dword [base+0x12FD4B4], 0`) makes S1→S2→S4 idempotent: the bootstrap can be reached more than once (e.g. if the engine re-invokes the stub as a DLL entry) and will decompress only on the first pass.
+Key state variables:
 
-### 11.2 Entry-stub control-flow graph — **confirmed**
-
-```
-                      +-----------------------------+
-                      | 04E7D000  push args         |
-                      | 04E7D00C  mov eax,038F9058  |
-                      | 04E7D011  push eax  (FAKE)  |
-                      | 04E7D017  push ebp/mov ebp  |
-                      +--------------+--------------+
-                                     | jmp
-                                     v
-                      +-----------------------------+
-              +------>| 04E7D0F0  cmp [ctr],3       |
-              |       +------+---------------+------+
-              |         jb   |               | >=3
-              |              v               v
-              |   +---------------------+   +--------------------------+
-              |   | 04E7D01F junk setup |   | 04E7D0FD cmp [ebp+C],    |
-              |   | loop A x0x800       |   |          0xAB4130  (x3)  |
-              |   | loop B x0x1300      |   |   all FALSE (opaque)     |
-              |   | loop C x0x1800      |   +------------+-------------+
-              |   | 04E7D0EA inc [ctr]  |                |
-              |   +----------+----------+                v
-              +--------------+              +---------------------------+
-                                            | 04E7D155 mov eax,0        |
-                                            | 04E7D15A leave            |
-                                            | 04E7D15B ret 0xC  ========|==> 0x038F9058
-                                            +---------------------------+
-                (dead island 04E7D15E..04E7D20F: "WL  " markers, 0xDEADBE01/02,
-                 ImportAnchor call table, int3)
-```
-
-### 11.3 Observable runtime states
-
-| State | Externally observable signature | Evidence |
-|---|---|---|
-| S1 | Burst of exactly 92,928 calls — `GetModuleHandleA` / `LoadLibraryA("kernel32.dll")` / `FreeLibrary` / `VirtualAlloc`+`VirtualFree` (4 KB, `PAGE_READWRITE`) — with no other side effects | confirmed (disassembly) |
-| S3 | ~28.3 MB written into the `.winlice` range `0x018A7000`–`0x034F9000`; committed private RWX memory; measurable CPU burn, no I/O | confirmed |
-| S4/S5 | Registry reads under `Software\WinLicense`; possible reads of `TMLicenseA1.dat` / `extendkey.dat`; large in-place writes across RVA `0x1000`–`0x188F4E8` | inferred from strings |
-| S6 | Normal Win32 GUI: window creation, message loop | inferred |
-| S7 | Message box / console text containing `CheckIN  = %d`, `CheckOUT = %d`, … | confirmed (format strings) |
+* **`.data[0x4E7C079]`** — warm-up round counter, 0→3. **[CONFIRMED]**
+* **`dword [.winlice+0x12FD4B4]`** — "kernel already materialized" flag: 0 in a fresh process (section is zero-filled); non-zero (code bytes `55 E9 …` = 0xAFC6E955) after unpacking. The driver's pre-check makes the unpack stage idempotent — if the kernel re-enters the driver it skips straight to the jump. **[CONFIRMED mechanism]**
+* **VM context (EBP) + key register** — continuously mutated state inside the interpreter; EFLAGS snapshots stored into the context provide tamper detection. **[CONFIRMED mechanics]**
+* **TLS index (0x1C9A658)** — allocated by the loader; the kernel uses TLS for per-thread protection state (inferred from the preserved `.tls` sections and the TLS-helper plugin). **[INFERRED]**
 
 ---
 
 ## 12. Feature-by-Feature Analysis
 
-> Features are split into **(A) features of the protective wrapper** (recoverable) and **(B) features of the payload application** (not recoverable).
-
-### A1 — Multi-stage self-decompression — **confirmed**
-
-*How it works:* the 21.5 MB `.boot` section holds 32 aPLib streams, each compressing to exactly 928,000 bytes of output. A 331-byte bootstrap (trampoline + depacker + driver) expands them into the zero-filled RWX `.winlice` section. Compression ratio ≈ 1.32:1 (21.5 MB → 28.3 MB); the modest ratio reflects that the engine content is itself encrypted/mutated before compression.
-
-*Subsystems:* memory only. No files, no registry, no network during this stage.
-
-*Verification:* re-implemented and reproduced exactly (see [§6 Stage 3](#stage-3--aplib-decompression--confirmed-and-reproduced)).
-
-### A2 — Anti-static-analysis entry obfuscation — **confirmed**
-
-Four distinct techniques in 0x265 bytes:
-
-1. **Fake return address.** `push imm32` + `leave`/`ret` — no static reference from `.text` to `.boot`.
-2. **`jmp +0`** at `0x04E7D012` — a zero-displacement jump used to break linear-sweep disassembly and naive signature matching.
-3. **Opaque predicates.** `jbe +0` at `0x04E7D050`/`0x04E7D09D`/`0x04E7D0DA`; three identical `cmp [ebp+0xC], 0xAB4130` tests guarding unreachable code.
-4. **Dead computation.** `shr`/`add`/`and` chains whose results are immediately overwritten (`mov ecx, 0x10000` → `and ecx, 0x600` → `mov ecx, 0x800`).
-
-### A3 — Anti-emulation / sandbox-fatigue API storm — **confirmed**
-
-Exactly **92,928 Win32 calls** are issued before any real work happens. Per outer pass: loop A contributes 5 calls × 2,048 = 10,240; loop B 3 × 4,864 = 14,592; loop C 1 × 6,144 = 6,144 — 30,976 per pass, × 3 passes. By API: **39,168 `GetModuleHandleA`, 6,144 `LoadLibraryA`, 6,144 `FreeLibrary`, 20,736 `VirtualAlloc`, 20,736 `VirtualFree`**. Against an instruction-level emulator or an API-logging sandbox this consumes the analysis budget and floods the trace. The loops have **no functional effect**: every allocation is immediately freed and every handle immediately discarded. — behaviour confirmed; *intent* is inference, though the complete absence of functional effect makes an anti-analysis purpose the only coherent explanation.
-
-### A4 — In-place payload encryption — **confirmed (presence), not recovered (algorithm)**
-
-All 11 payload sections with file content carry entropy 6.89–7.99. Attempting to aPLib-depack section 0's raw data fails immediately (`bad off 607 at 1`), so the outer transform is **not** aPLib — the content is encrypted first. Raw-to-virtual ratios (5.9 MB → 16.0 MB for `.text`; 3.3 MB → 6.8 MB for `.rsrc`) show compression is applied *beneath* the encryption.
-
-### A5 — Import protection / DLL preloading — **confirmed**
-
-The real import table is hidden. The visible `.idata` names 20 DLLs with deliberately unusual single functions, purely to force the loader to map every DLL the payload needs. The payload's genuine 23 KB `.idata` (RVA `0x01036000`) stays encrypted and is rebuilt by the engine.
-
-### A6 — Section-name wiping — **confirmed**
-
-Perfectly correlated with content rewriting (see [§2.4](#24-section-table--confirmed)). Defeats tools that fingerprint compilers by section name.
-
-### A7 — Code mutation / control-flow flattening — **confirmed**
-
-Demonstrated at `0x02FA44B4` (see [§6 Stage 4](#stage-4--secureengine-winlice--0x12fd4b4-va-0x02fa44b4--partially-recovered)). Basic blocks are scattered across megabytes and chained with `jmp rel32`; register operations are padded with dead arithmetic; an `ebp`-relative context replaces direct memory addressing.
-
-### A8 — Branch-trampoline registry (`.vm_sec`) — **confirmed (data)**, **strongly inferred (purpose)**
-
-437 verified records. See [§8 C8](#c8--vm_sec-branch-fixup-table-fully-parsed--confirmed).
-
-### A9 — Licensing subsystem — **confirmed (artefacts)**, **inferred (algorithm)**
-
-Recovered artefacts:
-
-| Kind | Value | `.winlice` offset |
-|---|---|---|
-| Registry key | `Software\WinLicense` | `0x428C`, `0x131F478` |
-| Registry key | `SOFTWARE\WinLicense` | `0x13B71C4` |
-| Registry key | `Software\WLkt` | `0x13BBE44` |
-| Registry key (template) | `Software\MyCompany\MyProduct` | `0x1396A3C` |
-| Registry key (template) | `Software\Company\Product` | `0x13B6AB8` |
-| Value name | `Activation3417377625` | `0x13284E0` |
-| Value name | `trial_ext` | `0x13E5258` |
-| Value name | `license` | `0x13AB838` |
-| File (UTF-16) | `TMLicenseA1.dat` | `0x1397010` |
-| File (UTF-16) | `extendkey.dat` | `0x13965EC` |
-| Version value | `WinLicenseVersion` | `0x618` |
-| Version value | `WinLicenseDriverVersion` | `0x1397250` |
-| Instance value | `WinLicenseInstance` | `0x56FDC` |
-
-`Software\MyCompany\MyProduct` and `Software\Company\Product` are the stock placeholder values shown in the Themida/WinLicense project UI, indicating those project fields were left at their defaults for this build.
-
-### A10 — Command-line interface — **confirmed (strings)**, **inferred (semantics)**
-
-Sixteen switch strings were recovered from the engine image:
-
-| Switch | Offset | Likely role (inferred from the name) |
-|---|---|---|
-| `/nosplash` | `0x3D34` | suppress the splash window (see `SplashClassName` @ `0x13A2FC8`) |
-| `/dumpstatus` | `0x34588` | dump protection status |
-| `/skipactivexreg` | `0x4C0F0` | skip ActiveX/COM self-registration |
-| `/showcode` | `0x13A3428` | display an identification code |
-| `/showcode2` | `0x6331C` | alternate code display |
-| `/getwlstatus` | `0x131C8F4` | query WinLicense status |
-| `/logstatus` | `0x132B98C` | write a status log |
-| `/bugcheck` | `0x134EC80` | diagnostic report |
-| `/bugcheck2` | `0x132B99C` | extended diagnostic report |
-| `/bugcheckfull` | `0x133637C` | full diagnostic report |
-| `/showinstance` | `0x1336390` | show the instance identifier |
-| `/clrt` | `0x133CCF4` | clear runtime/trial data (inferred) |
-| `/checkprotection` | `0x13985AC` | self-test of the protection layer |
-| `/deactivate` | `0x13A7DC4` | deactivate the licence |
-| `/forcerun` | `0x13D7544` | bypass a blocking condition and run |
-| `/dis1` | `0x4FDC` | unknown |
-
-Because these strings live in the **protector**, they are processed before the payload's own argument handling. Argument-parsing code was not located (it is inside mutated regions), so the exact matching rules (case sensitivity, `-` vs `/`) are **unknown**.
-
-### A11 — Diagnostic / bug-check reporting — **confirmed**
-
-A complete report template was recovered at `.winlice+0x13D968C`:
-
-```
-Please, contact the software developers with the following codes. Thank you. (version %d.%d.%d)
-       (press CTRL+C on this window to copy to clipboard)    
-CheckIN  = %d
-CheckOUT = %d
-ProcIN   = %d
-ProcOUT  = %d
-ExitIN   = %d
-ExitOUT  = %d
-TPin     = %d
-HWIn     = %d
-IntV     = %x, %x, %x, %x
-```
-
-Supporting format strings elsewhere in the image: `CHECK_IN = %d` (`0x1331638`), `CHECK_OUT = %d` (`0x46DA0`), `PROC_IN = %d` (`0x2F7E4`), `PROC_IN = %d, Process = %x` (`0x16618`), `PROC_OUT = %d` (`0x1331624`), `PROC_OUT = %d, Process = %x` (`0x135351C`), `HOOK_IN = %d` (`0x130821C`), `TP_IN = %d` (`0x33B3C`). Plus `Exception Information` (`0x13B49B0`) and `ExpInfo` (`0x1301AB8`).
-
-*Interpretation:* SecureEngine maintains paired entry/exit counters around its own protected regions (`CheckIN`/`CheckOUT`, `ProcIN`/`ProcOUT`, `ExitIN`/`ExitOUT`), plus a thread-protection counter (`TPin`) and a hardware/HWID counter (`HWIn`). When a protected region is entered but not correctly exited — the classic signature of a patched or externally-interrupted protection routine — the counters diverge and this report is displayed. The "press CTRL+C on this window to copy to clipboard" wording indicates it is rendered in a **`MessageBox`** (which supports Ctrl+C copy), not a console. — **strongly inferred**.
-
-### A12 — Process terminate-and-relaunch — **confirmed** (see [§13.3](#133-terminate-and-relaunch-stub--fully-reconstructed))
-
-### A13 — DLL bundling TLS support (XBundler) — **confirmed** (artefact) / **strongly inferred** (purpose) — see [§8 C9](#c9--xbundlertlshelperdll--confirmed)
-
-### A14 — Splash screen — **strongly inferred**
-
-`SplashClassName` (`0x13A2FC8`) plus the `/nosplash` switch imply the protector can display a splash/nag window and locate it by window class.
-
-### A15 — Kernel driver interaction — **uncertain**
-
-`WinLicenseDriverVersion` (`0x1397250`) implies a version handshake with an Oreans kernel-mode component. **No driver file, no `\\.\`device path, no `CreateFile`/`DeviceIoControl` string, and no `.sys` resource was found anywhere in this binary.** Historic Oreans marketing describes "Ring0 technology" [2](https://www.oreans.com/ThemidaPad.xml), but nothing in *this* file confirms a driver is present or loaded.
-
-### B — Payload application features — **not recoverable**
-
-Nothing about the protected application's own functionality can be established from this file. What *can* be said, all inferred from the preloaded DLL set and section geometry:
-
-* It is a large Delphi/VCL desktop GUI application: 16.0 MB of code, 6.8 MB of resources, 23 KB of imports.
-* It uses common dialogs, printing (`winspool.drv`), shell integration (`shell32`, `shlwapi`, `SHFolder`), OLE/COM (`ole32`, `oleaut32`, `oledlg`), multimedia (`winmm`), IME (`imm32`) and sockets (`wsock32`).
-* It links **madExcept** for crash reporting.
-* It exposes no meaningful API (its only exports are compiler defaults plus madExcept's tracer).
+| # | Feature | Status | How it works internally |
+|---|---|---|---|
+| F1 | **Code virtualization engine** | CONFIRMED (mechanics) | Post-unpack kernel is a bytecode VM: encoded operands fetched via `ctx+0x84`, decrypted with an XOR/ADD-evolved key, dispatched through a handler table at `ctx+0x38`; per-handler code at `.winlice` low offsets; program bytes at +0x60000–+0x280000 remain encrypted even after the aPLib stage. |
+| F2 | **Multi-stage packing (aPLib)** | CONFIRMED | 32 aPLib blocks × 928,000 B unpacked by `.boot` into the RWX `.winlice` section; driver self-locates the destination from its own return address. |
+| F3 | **Anti-emulation / timing gauntlet at EP** | CONFIRMED code, INFERRED intent | 3×3 warm-up loops, ≈39k GMA / ≈20.7k VA-VF / ≈6.1k LLA-FL calls (§5.2). |
+| F4 | **Import minimization + runtime import rebuilding** | CONFIRMED (tables) / INFERRED (rebuild) | 33 static imports across 20 DLLs; `.data` holds the hint/name bootstrap table for the kernel to resolve the real API set (LLA + GPA equivalents). |
+| F5 | **Encrypted configuration in fake delay-import dir** | CONFIRMED content / INFERRED purpose | 36 pseudo-random 32-byte records at RVA 0x103C000 (§18). |
+| F6 | **Debugger/madExcept-friendly exports** | CONFIRMED | 4 Delphi exports preserved (§2.5). |
+| F7 | **Bundled-file (XBundler) support** | STRONGLY INFERRED | `skeleton.dll`/`TestHello` record in `.data`; `XBundlerTlsHelper` plugin DLL embedded in the kernel (PDB path names `plugins_manager/internal_plugins/embedded dlls`). |
+| F8 | **Process-restart helper** | CONFIRMED (code) / INFERRED (usage) | Embedded 2007 EXE kills a PID and respawns a program (§8.5, §13.4). |
+| F9 | **Resource preservation** | CONFIRMED | Original icon set (`MAINICON`), dialogs, string table, version block kept in `.rsrc` (§19). |
+| F10 | **Authenticode signing** | CONFIRMED | Valid SHA-256 signature over the protected artifact, individual Certum cert, RFC-3161 timestamp 2025-10-10 09:25:29Z (§2.4). |
+| F11 | **Licensing (WinLicense) logic** | UNCERTAIN/INFERRED | Fingerprint-capable imports (`NetWkstaGetInfo`, `RegQueryValueExW`, `SHGetFolderPathW`, `GetVersionExA`, `VerQueryValueA`) + "WL" markers + `.winlice` section name suggest WinLicense licensing checks executed inside the VM — the logic itself is encrypted and unrecoverable. |
+| F12 | **Anti-tamper / integrity** | PARTIALLY CONFIRMED | "Already unpacked" flag + idempotent driver; EFLAGS-into-context tricks in the VM; byte-exact signature (OS-side validation only, not self-checking — no self-hash code found in plaintext). |
+| F13 | **Original GUI application** | CONFIRMED existence / content NOT recoverable | ~16.7 MB encrypted Delphi program self-identified as Themida 3.2.4.52 (see §24). |
 
 ---
 
-## 13. Detailed Program Logic
+## 13. Detailed Program Logic (reconstructed pseudocode)
 
-### 13.1 aPLib depacker — fully reconstructed — **confirmed**
-
-The routine at `0x038F905D` is the standard aPLib byte-oriented LZSS decoder with the bit reader inlined at every site. Prologue and bit primitive:
-
-```asm
-038F905D  push ebx
-038F905E  mov  ebx, esp
-038F9060  push ebx                    ; save frame ptr for the epilogue
-038F9061  mov  esi, [ebx+0x08]        ; arg1 = compressed source
-038F9064  mov  edi, [ebx+0x10]        ; arg3 = destination
-038F9067  cld
-038F9068  mov  dl, 0x80               ; bit buffer with sentinel
-038F906A  mov  al, [esi] / inc esi / mov [edi],al / inc edi   ; first literal, verbatim
-038F9070  mov  ebx, 2                 ; ebx == LWM state (2 = "last match not used")
-
-; getbit (repeated inline at 11 sites):
-    add dl, dl                        ; CF = next bit
-    jne  have                         ; buffer not exhausted
-    mov  dl, [esi] / inc esi
-    adc  dl, dl                       ; reload, shift in the sentinel
-have:
-```
-
-Tag dispatch (verified against the disassembly):
-
-| Tag bits | Handler | Address |
-|---|---|---|
-| `0` | literal byte; `LWM = 2` | `0x038F906A` |
-| `10` | gamma-coded match | `0x038F90DC` |
-| `110` | short match: 7-bit offset, 2-bit length; offset 0 = **end of stream** | `0x038F917D` |
-| `111` | single byte from a 4-bit offset (offset 0 ⇒ emit `0x00`); `LWM = 2` | `0x038F909C` |
-
-Gamma-coded match handler:
-
-```asm
-038F90DC  mov eax, 1
-          do { eax = eax*2 + getbit(); } while (getbit());   ; Elias-gamma
-038F90F7  sub eax, ebx                 ; ebx = 2 (LWM=0) or 1 (LWM=1)
-038F90F9  mov ebx, 1
-038F90FE  jne  codepair
-          ; ---- offset reuse (R0) ----
-038F9100  ecx = getgamma()             ; length
-038F911B  push esi / mov esi,edi / sub esi,ebp / rep movsb / pop esi
-038F9123  jmp  nexttag
-codepair:
-038F9128  dec eax / shl eax,8 / mov al,[esi] / inc esi   ; offset = (g-ebx-1)*256 + byte
-038F912F  mov ebp, eax                 ; ebp = R0 (last offset)
-038F9131  ecx = getgamma()             ; length
-038F914C  cmp eax, 0x7D00 (32000) ; jae  -> add ecx,2
-038F9153  cmp eax, 0x0500 (1280)  ; jb   -> check 127
-038F915A  inc ecx                      ; 1280 <= off < 32000  -> len += 1
-038F9168  cmp eax, 0x7F (127)     ; ja   -> no adjustment
-038F916D  add ecx, 2                   ; off <= 127           -> len += 2
-038F9170  push esi / mov esi,edi / sub esi,eax / rep movsb / pop esi
-```
-
-Epilogue:
-
-```asm
-038F919E  pop  ebx                     ; frame ptr saved at 038F9060
-038F919F  sub  edi, [ebx+0x10]         ; bytes written = edi - dst
-038F91A2  mov  eax, edi                ; return value
-038F91A4  pop  ebx
-038F91A5  ret  0x10
-```
-
-**Critical detail:** `ESI` is *not* restored. The caller relies on this — after each call `ESI` already points at the next stream, which is why the driver loop never advances it explicitly.
-
-Equivalent C (this is the code in `tools/aplib_unpack.c`, validated against the binary):
+### 13.1 Entry stub (Layer 0) — **[CONFIRMED]**
 
 ```c
-size_t aP_depack(const uint8_t **psrc, uint8_t *dst0, uint8_t *dst) {
-    const uint8_t *src = *psrc; uint8_t *d = dst;
-    unsigned ebx = 2, r0 = 0; tag = 0x80;
-    *d++ = *src++;                                  /* first literal */
-    for (;;) {
-        if (!getbit()) { *d++ = *src++; ebx = 2; continue; }        /* 0   */
-        if (!getbit()) {                                            /* 10  */
-            unsigned g = getgamma(), off = g - ebx, len; ebx = 1;
-            if (off == 0) { len = getgamma(); off = r0; }
-            else { off = ((off - 1) << 8) | *src++;
-                   len = getgamma();
-                   if      (off >= 32000) len += 2;
-                   else if (off >=  1280) len += 1;
-                   else if (off <=   127) len += 2;
-                   r0 = off; }
-            while (len--) { *d = *(d - off); d++; }
-            continue;
+void entry(void) {                       // VA 0x4E7D000
+    uint32_t v3 = *(uint32_t*)(esp0 + 0x4);   // obfuscated triple copy
+    uint32_t v2 = *(uint32_t*)(esp0 + 0x8);
+    uint32_t v1 = *(uint32_t*)(esp0 + 0xC);
+    // forge stack: [v3][v2][v1][0x38F9058][ebp]
+
+    for (round = 0; round < 3; round++) {          // counter @ 0x4E7C079
+        for (i = 0x800;  i; i--) {                 // 2,048
+            GetModuleHandleA(NULL);
+            HMODULE h = LoadLibraryA("kernel32.dll");  // 0x4E7C06C
+            FreeLibrary(h);
+            void *p = VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE);
+            VirtualFree(p, 0, MEM_RELEASE);
         }
-        if (!getbit()) {                                            /* 110 */
-            unsigned b = *src++, len = 2 + (b & 1), off = b >> 1;
-            if (off == 0) break;                    /* END OF STREAM */
-            r0 = off; ebx = 1;
-            while (len--) { *d = *(d - off); d++; }
-            continue;
+        for (i = 0x1300; i; i--) {                 // 4,864
+            GetModuleHandleA(NULL);
+            void *p = VirtualAlloc(...); VirtualFree(p, ...);
         }
-        { unsigned off = 0;                                         /* 111 */
-          for (int i = 0; i < 4; i++) off = (off << 1) + getbit();
-          if (off) { *d = *(d - off); d++; } else *d++ = 0;
-          ebx = 2; }
+        for (i = 0x1800; i; i--)                   // 6,144
+            GetModuleHandleA(NULL);
     }
-    *psrc = src;                                    /* ESI left past the stream */
-    return (size_t)(d - dst);
+
+    if (v2 == 0xAB4130)                            // obfuscated 3x compare chain
+        MessageBoxA(NULL, "dummy", "dummy", MB_OK);
+
+    return /* eax = 0 */;                          // leave; ret 0xC -> 0x38F9058
 }
 ```
 
-### 13.2 Bootstrap driver — pseudocode — **confirmed**
+### 13.2 Boot driver (Layer 1) — **[CONFIRMED]**
 
 ```c
-#define WINLICE_DELTA   0x01C52058u   /* VA(.boot+0x58) - RVA(.winlice)          */
-#define ENGINE_OFFSET   0x012FD4B4u   /* entry offset inside the .winlice arena  */
-#define TABLE_OFFSET    0x00000206u   /* stream table, relative to .boot         */
+void block_driver() {                            // 0x38F91A8
+    uint8_t *self = (uint8_t*)0x38F905D;         // return address
+    uint8_t *winlice = self - 5 - 0x1C52058;     // = 0x1CA7000
+    void   (*depack)(...) = (void*)0x38F905D;    // aPLib depacker
 
-void BootMain(void *return_addr /* = VA(.boot+0x5D), obtained via pop */)
-{
-    uint8_t *depack = (uint8_t *)return_addr;          /* aP_depack entry        */
-    uint8_t *base   = (depack - 5) - WINLICE_DELTA;    /* == .winlice            */
-    uint32_t *guard = (uint32_t *)(base + ENGINE_OFFSET);
-
-    if (*guard == 0) {                                 /* first execution only   */
-        const uint8_t *src = depack + 0x1A9;           /* == .boot + 0x206       */
-        uint8_t *dst = base;
-        for (uint8_t n = *src++; n != 0; n--) {
-            size_t written = ((depack_fn)depack)(src, 0, dst, 0, dst);
-            dst += written;                            /* src advanced by callee */
+    if (*(uint32_t*)(winlice + 0x12FD4B4) == 0) {        // not yet unpacked
+        uint8_t *src = (uint8_t*)0x38F9206;              // .boot+0x206
+        uint8_t *dst = winlice;
+        for (int n = *src++; n; n--) {
+            size_t produced = depack(src, 0, dst, 0, dst, ...); // aPLib
+            dst += produced;                                   // always 928,000
         }
     }
-    goto *(base + ENGINE_OFFSET);                      /* jmp eax                */
+    jmp *(winlice + 0x12FD4B4);                  // -> 0x2FA44B4 (VM entry)
 }
 ```
 
-Concrete values: `base = 0x00400000 + 0x018A7000`; engine entry = `0x02FA44B4`; `n = 32`; total written `0x1C52000`.
-
-### 13.3 Terminate-and-relaunch stub — fully reconstructed — **confirmed**
-
-Complete reconstruction of the 544-byte `.text` at `0x00401000`:
+### 13.3 VM fetch-decode-dispatch (essence, from `.winlice+0`) — **[CONFIRMED mechanics]**
 
 ```c
-/* Invoked as:   <stub>.exe  "<pid>" "<program>" ["<arguments>"]        */
-void main(void)
-{
+for (;;) {
+    uint16_t enc  = fetch16(ctx->ip + 6);
+    uint32_t k    = enc ^ ctx->key;             // ctx = ebp
+    ctx->key     ^= k + ctx->k54;
+    ctx->st20    &= 0x0C6D2D77;                 // state churn
+    // ... several more decoded fields, EFLAGS sometimes captured ...
+    uint32_t idx  = ((fetch16(ctx->ip + 0xA) + ctx->key) & 0xFFFF) << 2;
+    void *handler = *(void**)(ctx->table38 + idx);
+    ctx->ip      += fetch32(ctx->ip);           // embedded jump delta
+    goto *handler;
+}
+```
+
+### 13.4 Embedded restart helper `main()` — **[CONFIRMED]**
+
+```c
+void main() {                                    // helper base 0x401000
     char *p = GetCommandLineA();
+    p = skip_own_exe_token(p);                   // quoted or space-delimited
 
-    /* ---- skip argv[0], handling both quoted and bare forms ---- */
-    if (*p == '"') {
-        p++;
-        while (*p++ != '"') ;                 /* scasb loop @ 0x0040100F */
-        if (*p == 0) goto done;
-        p++;
-        if (*p == 0) goto done;
-    } else {
-        while (*p) { if (*p == ' ') { p++; break; } p++; }
-        if (*p == 0) goto done;
+    extract_quoted(buf_pid   = 0x403153, p);     // arg1: PID string
+    extract_quoted(buf_cmd   = 0x403054, p);     // arg2: program
+    if (*p) {
+        extract_quoted(buf_arg3 = 0x403161, p);  // optional arg3
+        append(buf_cmd, " ");                    // 0x403264 = " "
+        append(buf_cmd, buf_arg3);
     }
 
-    /* ---- tokenise three quoted arguments ---- */
-    p = extract_quoted(g_pid_text, p);        /* 0x403153 : decimal PID  */
-    p = extract_quoted(g_cmd,      p);        /* 0x403054 : program      */
+    DWORD pid = atoi(buf_pid);
+    HANDLE h  = OpenProcess(PROCESS_ALL_ACCESS /*0x1F0FFF*/, FALSE, pid);
+    if (h) TerminateProcess(h, 0);
 
-    if (*p != 0) {                            /* optional third token    */
-        extract_quoted(g_args, p);            /* 0x403161                */
-        strcat(g_cmd, " ");                   /* literal at 0x403264     */
-        strcat(g_cmd, g_args);
-    }
-
-    /* ---- kill the caller ---- */
-    g_pid   = atoi_signed(g_pid_text);        /* -> 0x40315D             */
-    g_hproc = OpenProcess(PROCESS_ALL_ACCESS /*0x1F0FFF*/, FALSE, g_pid);
-    TerminateProcess(g_hproc, 0);
-
-    /* ---- segment-selector probe (see note) ---- */
-    { uint16_t sel = read_ds();               /* mov bx, ds              */
-      if (sel & 4) Sleep(1000); }             /* TI bit: 0=GDT, 1=LDT    */
+    if ((DS & 4) != 0) Sleep(1000);              // legacy OS check [UNCERTAIN]
     Sleep(1000);
 
-    /* ---- relaunch ---- */
-    GetStartupInfoA(&g_si);
-    g_si.cb          = 0x44;
-    g_si.lpReserved  = NULL;
-    g_si.dwFlags     = STARTF_USESHOWWINDOW;  /* 1 */
-    g_si.wShowWindow = SW_SHOWNORMAL;         /* 1 */
+    STARTUPINFOA si; GetStartupInfoA(&si);
+    si.cb = 0x44; si.lpReserved = 0;
+    si.dwFlags = STARTF_USESHOWWINDOW; si.wShowWindow = SW_SHOWNORMAL;
 
-    if (g_args[0])
-        CreateProcessA(NULL,  g_cmd, NULL, NULL, FALSE,
-                       CREATE_NEW_CONSOLE|NORMAL_PRIORITY_CLASS /*0x30*/,
-                       NULL, NULL, &g_si, &g_pi);
+    if (buf_arg3[0])
+        CreateProcessA(NULL, buf_cmd, NULL, NULL, FALSE,
+                       NORMAL_PRIORITY_CLASS|CREATE_NEW_CONSOLE /*0x30*/,
+                       NULL, NULL, &si, &pi /*0x403044*/);
     else
-        CreateProcessA(g_cmd, NULL,  NULL, NULL, FALSE,
-                       CREATE_NEW_CONSOLE|NORMAL_PRIORITY_CLASS,
-                       NULL, NULL, &g_si, &g_pi);
-done:
+        CreateProcessA(buf_cmd, NULL, NULL, NULL, FALSE, 0x30,
+                       NULL, NULL, &si, &pi);
     ExitProcess(0);
 }
 ```
 
-Helper routines, verbatim from the disassembly:
+### 13.5 `XBundlerTlsHelper` `DllMain` — **[CONFIRMED]**
 
 ```c
-/* 0x0040114D — copy the text between the next pair of double quotes. */
-char *extract_quoted(char *dst, char *src) {
-    while (*src != '"') src++;      /* find opening quote  */
-    src++;
-    while (*src != '"') *dst++ = *src++;
-    src++;
-    return src;                     /* just past the closing quote */
-}
-
-/* 0x004011A9 — signed decimal parse, obfuscated with sbb/adc/add/xor.
-   `cmp byte[s],0x2E` sets CF for any leading char < '.', e.g. '-' (0x2D):
-   the char is skipped and the final result is negated via (x-1)^(-1). */
-int atoi_signed(const char *s) {
-    int neg = (*s < '.'); if (neg) s++;
-    int v = 0;
-    while (*s >= '0') { v = v * 10 + (*s - '0'); s++; }
-    return neg ? -v : v;
-}
-
-/* 0x004011D7 */ void strcat(char *d, const char *s)
-    { while (*d) d++; while (*s) *d++ = *s++; }
-
-/* 0x00401177 — present but NOT referenced in the recovered flow. */
-int str_equal(const char *a, const char *b);
-```
-
-> **Note on `mov bx, ds; test bl, 4`.** Bit 2 of an x86 segment selector is the Table Indicator: 0 = GDT, 1 = LDT. Under normal Win32 `DS = 0x23`, so the test is false and the branch is skipped — the stub performs a single `Sleep(1000)`. An environment that placed the data segment in the LDT would take the branch and sleep twice. Whether this is an intentional environment probe or vestigial code **cannot be determined**; the only effect either way is an extra one-second delay.
-
-**Purpose (strongly inferred):** SecureEngine writes this stub to disk (or maps it), launches it with the protected process's own PID and image path, and the stub then kills and restarts the application. This implements "restart required" flows such as post-activation restarts, trial-extension application, or recovery after a protection fault. The `Sleep(1000)` guarantees the handle/executable lock is released before `CreateProcessA`.
-
-### 13.4 Entry-stub pseudocode — **confirmed**
-
-```c
-/* VA 0x04E7D000 — shaped like DllMain but reached as the PE entry point. */
-static DWORD g_counter;              /* .data:0x04E7C079, zero-initialised */
-
-BOOL __stdcall StubEntry(HINSTANCE hinst, DWORD reason, LPVOID reserved)
-{
-    /* [ebp+4] was pre-loaded with 0x038F9058 before the frame was built. */
-    while (g_counter < 3) {
-        for (unsigned i = 0x800;  i; i--) {          /* loop A */
-            GetModuleHandleA(NULL);
-            FreeLibrary(LoadLibraryA("kernel32.dll"));
-            VirtualFree(VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE),
-                        0, MEM_RELEASE);
-        }
-        for (unsigned i = 0x1300; i; i--) {          /* loop B */
-            GetModuleHandleA(NULL);
-            VirtualFree(VirtualAlloc(NULL, 0x1000, MEM_COMMIT, PAGE_READWRITE),
-                        0, MEM_RELEASE);
-        }
-        for (unsigned i = 0x1800; i; i--)            /* loop C */
-            GetModuleHandleA(NULL);
-        g_counter++;
+BOOL WINAPI DllMain(HINSTANCE h, DWORD reason, LPVOID r) {
+    switch (reason) {
+        case DLL_PROCESS_ATTACH: Sleep(1); return TRUE;   // 0x10001012
+        default:                 return TRUE;             // 0x1000101A
     }
-
-    if (reason == 0x00AB4130) MessageBoxA(0,"dummy","dummy",0);   /* dead */
-    if (reason == 0x00AB4130) MessageBoxA(0,"dummy","dummy",0);   /* dead */
-    if (reason == 0x00AB4130) MessageBoxA(0,"dummy","dummy",0);   /* dead */
-
-    return 0;   /* ... but `leave; ret 0xC` jumps to 0x038F9058 instead. */
 }
 ```
 
@@ -1505,690 +880,605 @@ BOOL __stdcall StubEntry(HINSTANCE hinst, DWORD reason, LPVOID reserved)
 
 ## 14. Filesystem Behavior
 
-### Confirmed from the file itself
+**No file I/O imports exist statically** (no `CreateFile*`, `WriteFile`, etc.), and none of the recoverable plaintext references filenames other than:
 
-* **The file has no overlay.** The certificate blob begins at `0x01F55E58` and ends at `0x1F586C8`, the exact end of file. No appended archive, config, or dropped payload is stored outside the PE structure.
-* **The bootstrap performs no file I/O.** Stages 0–3 touch only memory; the only file-related API reachable from the stub is `LoadLibraryA("kernel32.dll")`, which resolves an already-loaded module.
+* `kernel32.dll` (bootstrap string, 0x4E7C06C),
+* `skeleton.dll` (bundled-file record, 0x4E7C288) — with XBundler, bundled DLLs are materialized (typically into the process via manual mapping or dropped to a temp location) at runtime **[INFERRED]**,
+* `SHGetFolderPathW` (special folders) — consistent with path resolution for bundled/licensing data at runtime **[INFERRED]**.
 
-### Inferred from recovered strings (engine stage)
-
-| Artefact | Offset in `.winlice` | Encoding | Likely role |
-|---|---|---|---|
-| `TMLicenseA1.dat` | `0x1397010` | UTF-16LE | WinLicense licence-key file |
-| `extendkey.dat` | `0x13965EC` | UTF-16LE | trial-extension key file |
-
-No directory path, no `%APPDATA%`/`%TEMP%` string, and no `CreateFileW`/`GetTempPath` literal was recovered, so **the search locations for these files are unknown**. The presence of `SHFolder!SHGetFolderPathW` in the preload set suggests a known-folder lookup is used somewhere, but that import may equally belong to the payload.
-
-The terminate-and-relaunch stub (C10) exists as an in-memory PE image. Whether SecureEngine writes it to disk before launching it, or maps and runs it from memory, **could not be determined** — no drop path was recovered.
-
----
+Everything else is not statically observable because the kernel's file operations (if any) are virtualized/encrypted. **No dropped-file names, extensions or paths could be recovered. [UNCERTAIN]**
 
 ## 15. Registry / System Interaction
 
-### Confirmed artefacts
-
-| Key / value | Offset | Notes |
-|---|---|---|
-| `Software\WinLicense` | `0x428C`, `0x131F478` | appears twice |
-| `SOFTWARE\WinLicense` | `0x13B71C4` | upper-case variant |
-| `Software\WLkt` | `0x13BBE44` | secondary key (purpose unknown) |
-| `Software\MyCompany\MyProduct` | `0x1396A3C` | **default placeholder** from the protection project |
-| `Software\Company\Product` | `0x13B6AB8` | **default placeholder** |
-| `Activation3417377625` | `0x13284E0` | value name; the numeric suffix is a per-project identifier |
-| `trial_ext` | `0x13E5258` | trial-extension record |
-| `license` | `0x13AB838` | licence record |
-| `WinLicenseVersion` | `0x618` | engine version value |
-| `WinLicenseDriverVersion` | `0x1397250` | driver version value |
-| `WinLicenseInstance` | `0x56FDC` | instance identifier |
-| `WLProjectName` | `0x164C4` | project name value |
-| `WLSoftwareName` | `0x46DB4` | product name value |
-| `WLSoftwareVersion` | `0x138D0B8` | product version value |
-| `WLProtectionDateTime` | `0x13899E8` | protection timestamp value |
-
-The only registry API in the visible import table is **`advapi32!RegQueryValueExW`** (IAT slot `0x01C9950C`) — and it is *not* referenced by the entry stub, so it is either a preload placeholder or resolved dynamically. **No `RegSetValueEx`, `RegCreateKey`, or `RegDeleteKey` string or import is present in the recoverable layers**, so whether the engine *writes* to the registry cannot be confirmed from this file. Trial-state persistence would normally require writes, so writes are **probable but unproven**.
-
-Hive (HKCU vs HKLM) is likewise **unknown** — the recovered strings are relative subkey paths with no root specified.
-
-### Other system interaction
-
-* **Manifest-declared:** Common-Controls 6.0 side-by-side assembly; per-monitor DPI awareness; `asInvoker` execution level (**no UAC elevation, no `uiAccess`**); declared compatible with Vista/7/8/8.1/10 GUIDs.
-* **No service, scheduled-task, startup-folder, Run-key, WMI, or COM-registration artefact** was found in any recoverable layer. `/skipactivexreg` hints the *payload* may self-register ActiveX components, but no COM registration code or CLSID was recovered.
-
----
+* **Recovered key/value names (round 2, §27.2) [CONFIRMED strings]:** `Software\WinLicense` (×3, one as `SOFTWARE\WinLicense`), `Software\MyCompany\MyProduct` and `Software\Company\Product` (WinLicense SDK **default placeholder** keys), `Software\WLkt`; value names `WinLicenseVersion`, `WinLicenseInstance`, `WinLicenseDriverVersion`. Together with the static import `advapi32!RegQueryValueExW`, this confirms **registry reads of WinLicense licensing state**; whether any values are written (no write API imported) is **UNKNOWN**.
+* Static import `advapi32!RegQueryValueExW` — registry **value reads** occur at runtime. **[CONFIRMED import; exact call sites UNKNOWN — no absolute pointers to the key strings exist in the kernel (position-independent addressing)]**
+* `version.dll!VerQueryValueA` + `kernel32!GetVersionExA` — OS version detection (WinLicense uses version checks to select behavior). **[CONFIRMED imports; use INFERRED]**
+* `netapi32!NetWkstaGetInfo` — workstation/domain information (common machine-fingerprint input for licensing). **[CONFIRMED import; use INFERRED]**
+* No registry **write** APIs are imported. Persistence mechanisms: **none found in any recoverable evidence** (no Run-key strings, no service creation, no scheduled-task strings). **[CONFIRMED absence in plaintext; encrypted logic remains UNKNOWN]**
 
 ## 16. Process and Thread Behavior
 
-### Confirmed
-
-* **Single-threaded bootstrap.** Stages 1–3 run entirely on the initial thread. No `CreateThread`, `CreateRemoteThread`, thread-pool, or APC API appears in the import table or the recovered stub code.
-* **No TLS callbacks.** `AddressOfCallBacks = 0`, so no code runs on thread attach/detach via TLS — an unusual choice for a protector and a useful negative finding.
-* **Memory behaviour.** `.winlice` is a 28.3 MB **RWX** private commit written and then executed — the defining runtime signature of this binary. The stub additionally performs 20,736 transient 4 KB `VirtualAlloc`/`VirtualFree` cycles.
-* **Process manipulation capability is present but confined to the embedded stub (C10):** `OpenProcess(PROCESS_ALL_ACCESS)` → `TerminateProcess` → `CreateProcessA` with `CREATE_NEW_CONSOLE | NORMAL_PRIORITY_CLASS`. The stub targets a PID supplied on its own command line — by design, the protected process's own PID.
-* The protector image itself imports **no** process-manipulation API; all such calls come from the embedded stub or are resolved dynamically by the engine.
-
-### Inferred
-
-* The payload is a **VCL GUI application**, so after activation it runs a standard `TApplication` message loop on the main thread. Worker threads, if any, belong to the payload and are not recoverable.
-* Counter names `TP_IN` / `TPin` suggest a "thread protection" subsystem, implying SecureEngine creates at least one monitoring thread. No corroborating code was recovered — **uncertain**.
-* `WinLicenseInstance` and `/showinstance` suggest single-instance enforcement, which normally uses a named mutex or a window search. **No mutex name string was recovered.**
-
----
+* **Confirmed at startup:** single process, main thread only; no child processes spawned by Layers 0–1.
+* **TLS:** directory present, no callbacks; the kernel + `XBundlerTlsHelper` imply per-thread protection state via TLS. **[INFERRED]**
+* **Threads inside the kernel:** the SecureEngine kernel is publicly known to run monitor threads (anti-debug/anti-tamper watchdogs); no `CreateThread`/`CreateRemoteThread` imports are static, so thread creation happens through runtime-resolved APIs — **not statically provable [INFERRED]**.
+* **Confirmed child-process capability (dormant):** the embedded restart helper (§8.5) implements *terminate-PID + `CreateProcessA` respawn*; it would be written to disk/memory and launched by the kernel under conditions hidden in VM bytecode. **[code CONFIRMED; trigger UNKNOWN]**
+* No process-injection imports (contrast with sibling `test.exe`, Appendix A, which is a classic injector).
 
 ## 17. Network / IPC Behavior
 
-**No network activity can be attributed to the protective layers.**
-
-| Observation | Status |
-|---|---|
-| `wsock32.dll!__WSAFDIsSet` in the import table | confirmed present; **unreferenced** by the stub; a placeholder that forces WinSock to load |
-| No `ws2_32`, `wininet`, `winhttp`, `urlmon`, or `dnsapi` import | confirmed |
-| No URL, hostname, IP literal, or `http`/`https` string in `.boot`, `.winlice`, `.rsrc`, `.data`, or `.idata` | confirmed (exhaustive ASCII + UTF-16 scan) |
-| No named pipe, mailslot, socket path, shared-section name, or `CreateFileMapping` string | confirmed |
-
-The presence of `wsock32` in the preload list indicates **the payload** uses sockets; nothing indicates the protector does. Online licence activation, if the product supports it, is not evidenced in this binary.
-
-The only IPC-like mechanism recovered is the **command-line channel** between SecureEngine and the embedded relaunch stub (PID + program + arguments passed as quoted tokens).
+* Only networking-adjacent static import: `wsock32.dll!__WSAFDIsSet` (the `FD_ISSET` helper). No `socket`/`connect`/`send`/`recv`, no WinINet/WinHTTP, no URLs.
+* The only HTTP(S) strings in the entire 32 MB file are **CRL/OCSP/repository URLs inside the embedded X.509 certificates** (certum.pl) — metadata, not runtime C2.
+* **Conclusion:** no network communication is evidenced in any recoverable plaintext; if the WinLicense layer performs online activation, it is fully encrypted. **[no evidence found; encrypted logic UNKNOWN]**
+* IPC: none evidenced.
 
 ---
 
 ## 18. Configuration
 
-Configuration is **baked in at protection time**, not read from an external file.
+Two configuration carriers were identified:
 
-### Recovered configuration values — **confirmed**
+1. **Fake delay-import directory (RVA 0x103C000, 0xB34 bytes) [CONFIRMED content / STRONGLY INFERRED purpose]** — 36 consecutive 32-byte records of pseudo-random data (`0x9DFD18A0 0x2F79345B 0x986A383F …`) terminated by a zero record. Genuine `ImgDelayDescr` arrays cannot look like this; the loader ignores a malformed delay directory, making it a convenient hiding place for the protector's **encrypted options blob** (protection settings, VM keys/licensing parameters). Decrypting it requires runtime keys — not attempted.
+2. **`.data` bootstrap records [CONFIRMED]** — the runtime import-resolve tables (exact 14-entry hint/name list, §27.6), the `skeleton.dll`/`TestHello` bundled-file record, and small bookkeeping tables (§10.7).
+3. **Kernel-internal licensing configuration [CONFIRMED strings, §27.2]** — the unpacked kernel embeds its licensing parameters as plaintext/UTF-16 strings: registry keys (`Software\WinLicense`, `Software\MyCompany\MyProduct`, `Software\Company\Product`, `Software\WLkt`), value names (`WinLicenseVersion`, `WinLicenseInstance`, `WinLicenseDriverVersion`), and license-file names (`TMLicenseA1.dat`, `extendkey.dat`). The placeholder keys indicate the WinLicense options were left at defaults.
+4. **Embedded command-line switches [CONFIRMED strings; function INFERRED, §27.4]** — `/nosplash`, `/dis1`, `/dumpstatus`, `/skipactivexreg`, `/showcode2`, `/dmtc`, `/checkprotection` — the engine handles these switches in the protected process's command line.
 
-| Setting | Value | Source |
-|---|---|---|
-| Protector product / version | **Themida 3.2.4.52** | `RT_VERSION` |
-| Vendor | **Oreans Technologies** | `RT_VERSION` |
-| Protection project name | **`Themida64_GUI`** | UTF-16 at `.winlice+0x4CD40` and `+0x1339F94`, adjacent to `WLProjectName` |
-| Protection build timestamp | **`Fri Oct 10 11:25:48 2025`** | UTF-16 at `.winlice+0x1EA4` |
-| Registry key template | `Software\MyCompany\MyProduct`, `Software\Company\Product` | left at factory defaults |
-| Activation value name | `Activation3417377625` | per-project numeric identifier |
-| Stream layout | 32 aPLib streams × `0xE2900` bytes | `.boot+0x206` |
-| Engine entry offset | `0x12FD4B4` within `.winlice` | `.boot+0x1BC`, `+0x1F7` |
-| `.winlice` delta constant | `0x01C52058` | `.boot+0x1B4` |
-
-### Configuration mechanism — **strongly inferred**
-
-The `WL*` names are the field labels of the Themida/WinLicense project file. At protection time the tool writes the project's values (project name, software name, software version, protection date/time) into the engine's data area; at runtime the engine exposes them through the WinLicense SDK (`WLRegGetProjectName`-style APIs). The string `?2ndwsdk` (`.winlice+0x136C206`) is consistent with a "second WinLicense SDK" marker.
-
-**No `.ini`, `.cfg`, `.json`, `.xml` (other than the manifest), or environment-variable name was recovered anywhere in the file.**
+No INI/XML/JSON configuration text exists in recoverable plaintext (the manifest in `.rsrc` is the standard UI-compatibility manifest). **[CONFIRMED absence]**
 
 ---
 
-## 19. Resources
+## 19. Resources (`.rsrc`, RVA 0x189B000) **[CONFIRMED]**
 
-The outer `.rsrc` (RVA `0x0189B000`, 48 KB) is small; the payload's real 6.8 MB resource section is encrypted in section 10.
-
-| Type | ID / Name | Lang | Size | Notes |
+| Type | Name/ID | Lang | Size | Content |
 |---|---|---|---|---|
-| `RT_ICON` | 1 | 9 (English) | 1,128 | 16×16, 32 bpp, DIB |
-| `RT_ICON` | 2 | 9 | 4,264 | 32×32, 32 bpp, DIB |
-| `RT_ICON` | 3 | 9 | 9,640 | 48×48, 32 bpp, DIB |
-| `RT_ICON` | 4 | 9 | 29,381 | 256×256, **PNG-compressed** |
-| `RT_GROUP_ICON` | `MAINICON` | 9 | 62 | Delphi's default icon-group name |
-| `RT_DIALOG` | 1–4 | 9 | 380 / 324 / 332 / 200 | see below |
-| `RT_STRING` | 1 | **25 (Russian)** | 258 | see below |
-| `RT_VERSION` | 1 | 9 | 716 | see below |
-| `RT_MANIFEST` | 1 | 9 | 1,686 | see below |
+| RT_ICON (3) | 1 | 0x409 | 0x468 | 16×16, 32-bpp icon (BITMAPINFOHEADER `biSize=0x28, w=0x10, h=0x20, bpp=32`) |
+| RT_ICON (3) | 2 | 0x409 | 0x10A8 | 32×32 icon |
+| RT_ICON (3) | 3 | 0x409 | 0x25A8 | 48×48 icon |
+| RT_ICON (3) | 4 | 0x409 | 0x72C5 | 256×256 PNG-compressed icon (`\x89PNG`, IHDR 256×256, 8-bit RGBA) |
+| RT_GROUP_ICON (14) | **`MAINICON`** | 0x409 | 0x3E | Icon group — **`MAINICON` is the default Delphi project icon name**, corroborating a Delphi-built original program |
+| RT_DIALOG (5) | 1 | 0x409 | 0x17C | Dialog 360×149 dlu, Arial 8, 7 controls: SCROLLBAR "scroll", `msctls_progress32` "sd", LISTBOX "list", BUTTON "radio", BUTTON "button", COMBOBOX "combo", BUTTON "check" |
+| RT_DIALOG (5) | 2 | 0x409 | 0x144 | Dialog 527×263, 6 controls incl. `SysListView32` "list", COMBOBOX, BUTTON "mem"/"1"/"check", SCROLLBAR |
+| RT_DIALOG (5) | 3 | 0x409 | 0x14C | Dialog 279×186, 6 controls: BUTTON "mem"/"check"/"radio", SCROLLBAR, `msctls_progress32`, LISTBOX |
+| RT_DIALOG (5) | 4 | 0x409 | 0xC8 | Dialog 257×161, 3 controls: BUTTON "yy", `SysDateTimePick32` "date", BUTTON **"test"** |
+| RT_STRING (6) | 1 | **0x419 (Russian)** | 0x102 | 14 strings: `Соединение`(Connection), `Имя`(Name), `Пароль`(Password), `Сервер`(Server), `Соединить`(Connect), `Отмена`(Cancel), `База данных`(Database), `Порт`(Port), `Протокол`(Protocol), `Провайдер`(Provider), `Источник данных`(Data source), `Схема`(Schema), `Режим соединения`(Connection mode), `Режим`(Mode) |
+| RT_VERSION (16) | 1 | 0x409 | 0x2CC | `CompanyName=Oreans Technologies`, `FileDescription=Themida - Advanced Windows Software Protection`, `FileVersion=3.2.4.52`, `LegalCopyright=Oreans Technologies`, `OriginalFilename=Themida`, `ProductName=Themida`, `ProductVersion=3.2.4.52`, Translation 040904E4 |
+| RT_MANIFEST (24) | 1 | 0x409 | 0x696 | `dpiAware=True/PM`; dependency on `Microsoft.Windows.Common-Controls` 6.0; `requestedExecutionLevel asInvoker uiAccess=false`; `supportedOS` Vista/7/8/8.1/Win10 GUIDs |
 
-### `RT_VERSION` — **confirmed**
+Interpretation:
 
-```
-FileVersion       3.2.4.52          ProductVersion   3.2.4.52
-FileOS  = VOS__WINDOWS32 (4)        FileType = VFT_APP (1)     FileFlags = 0
-Translation       0x0409 / 0x04E4   (US English, Windows Multilingual)
-CompanyName       Oreans Technologies
-FileDescription   Themida - Advanced Windows Software Protection
-LegalCopyright    Oreans Technologies
-OriginalFilename  Themida
-ProductName       Themida
-ProductVersion    3.2.4.52
-```
-
-### `RT_MANIFEST` — **confirmed**
-
-Requests Common-Controls 6.0, `<dpiAware>True/PM</dpiAware>`, `requestedExecutionLevel level='asInvoker' uiAccess='false'`, and declares `supportedOS` GUIDs for Vista, 7, 8, 8.1 and 10. **No elevation is requested.**
-
-### `RT_ICON` / `MAINICON` — **confirmed**
-
-The 256×256 PNG was extracted and rendered: a **flat, light-blue/grey heraldic shield** with a lighter inner highlight — a generic "protection" emblem, consistent with a security product.
-
-### `RT_DIALOG` 1–4 — **confirmed structure, uncertain provenance**
-
-Four `DLGTEMPLATEEX` resources, all with style `0x80C800C0`, **no caption**, font **Arial 8 pt**, and placeholder control captions:
-
-| # | Size (DLU) | Controls |
-|---|---|---|
-| 1 | 360 × 149 | `SCROLLBAR`"scroll", `msctls_progress32`"sd", `LISTBOX`"list", `BUTTON`"radio", `BUTTON`"button", `COMBOBOX`"combo", `BUTTON`"check" |
-| 2 | 527 × 263 | `BUTTON`"mem" (style `0x50000007`), `COMBOBOX`"combo", `SysListView32`"list", `SCROLLBAR`"scroll", `BUTTON`"1", `BUTTON`"check" |
-| 3 | 279 × 186 | `BUTTON`"mem", `SCROLLBAR`"scroll", `BUTTON`"check", `msctls_progress32`"sd", `LISTBOX`"list", `BUTTON`"radio" |
-| 4 | 257 × 161 | `BUTTON`"yy", `SysDateTimePick32`"date", `BUTTON`"test" |
-
-Each dialog is a **sampler containing one of each standard Win32 control class** with the control type as its caption, at semi-random positions. Delphi VCL applications normally store their forms as `.dfm` streams in `RT_RCDATA`, not as `RT_DIALOG`, so these are not ordinary VCL forms. Their most plausible role is **rendering/measurement test templates** (theming, skinning, or DPI verification). Which component or which layer (protector template vs. payload) they belong to **could not be determined**.
-
-### `RT_STRING` #1 — **confirmed content, uncertain provenance**
-
-Language **25 (Russian)**, covering string IDs 0–15:
-
-| ID | String | Translation |
-|---|---|---|
-| 0 | `Соединение` | Connection |
-| 1 | `Имя` | Name |
-| 2 | `Пароль` | Password |
-| 3 | `Сервер` | Server |
-| 4 | `Соединить` | Connect |
-| 5 | `Отмена` | Cancel |
-| 6 | `База данных` | Database |
-| 7 | `Порт` | Port |
-| 8 | `Протокол` | Protocol |
-| 9 | `Провайдер` | Provider |
-| 10 | `Источник данных` | Data Source |
-| 11 | `Схема` | Schema |
-| 12 | `Режим соединения` | Connection mode |
-| 13 | `Режим` | Mode |
-
-This is a **Russian-localised database-connection dialog** vocabulary — the `resourcestring` table of some Delphi data-access component suite. Its presence in a software protector's resource section is anomalous and is **the single finding in this analysis that does not fit the "this is Themida.exe" conclusion cleanly**. Three explanations are possible and cannot be distinguished from this file alone:
-
-1. the payload links a Delphi DAC component package that carries these `resourcestring`s;
-2. they belong to the protector's own resource template (e.g. test data for the resource-encryption feature);
-3. they are deliberate decoy resources.
-
-**Marked uncertain.** It does not affect any other conclusion.
-
-### Resources of the embedded `XBundlerTlsHelper.dll` — **confirmed**
-
-One `RT_MANIFEST` (480 bytes): minimal `asInvoker` / `uiAccess=false` assembly manifest.
+* The **version block, MAINICON and dialogs are typical of the original (pre-protection) image**, since protectors preserve the resource section for Windows to consume. **[STRONGLY INFERRED]**
+* The dialogs are **dummy/test panels** (controls literally captioned "test", "yy", "1", "sd", "mem", "date", and generic control-type names) — they do not resemble a real application UI and look like auto-generated test resources, consistent with the filename `Test2.exe`. Whether they belong to the original app or were merged in during the protection test is **[UNCERTAIN]**.
+* The Russian RT_STRING block (database-connection vocabulary) has no clear owner in the recovered evidence **[UNCERTAIN]** — note, however, that the sibling `test.exe` also carries a Russian-language (0x419) resource, indicating a Russian-locale build environment for the sample set.
 
 ---
 
 ## 20. Error Handling
 
-### Recoverable layers — **confirmed**
-
-The bootstrap has **essentially no error handling**:
-
-* `StubEntry` ignores every return value. `LoadLibraryA`, `VirtualAlloc`, `GetModuleHandleA` results are discarded; a `NULL` from `VirtualAlloc` is passed straight to `VirtualFree` (harmless, returns `FALSE`).
-* `BootMain` validates nothing: no bounds check on the destination, no stream-length check, no checksum, no magic value. The only conditional in the whole routine is the re-entrancy guard.
-* `aP_depack` has no malformed-input detection; a corrupt stream would read or write out of bounds. Correctness relies entirely on the data being exactly what the protector wrote.
-* `int3` (`0xCC`) at `0x04E7D210` sits between the import anchor and the thunk table — padding, but it would raise `STATUS_BREAKPOINT` if reached.
-* The `.reloc` table is minimal (32 HIGHLOW entries); any load at a non-preferred base would still work for the stub but the engine's hard-coded absolute constants would not be fixed up — which is why ASLR is disabled.
-
-The embedded relaunch stub is equally permissive: it does not check `OpenProcess`, `TerminateProcess`, or `CreateProcessA` for failure and always `ExitProcess(0)`.
-
-### Engine layer — **strongly inferred**
-
-Three tiers of error reporting are evidenced:
-
-1. **Counter-based self-consistency.** Paired `CheckIN`/`CheckOUT`, `ProcIN`/`ProcOUT`, `ExitIN`/`ExitOUT` counters bracket protected regions. Divergence indicates tampering or an interrupted protection routine.
-2. **Bug-check report.** The template in [§12 A11](#a11--diagnostic--bug-check-reporting--confirmed) renders all counters plus `TPin`, `HWIn` and a four-word `IntV` value. Reachable via `/bugcheck`, `/bugcheck2`, `/bugcheckfull`.
-3. **Payload-level exception handling.** `madTraceProcess` in the export table proves **madExcept** is linked, so the application itself installs a global exception filter producing formatted bug reports with stack traces. `Exception Information` (`0x13B49B0`) and `ExpInfo` (`0x1301AB8`) may belong to either layer.
-
-`MessageBoxA` is the only UI primitive in the protector's import table, and the "press CTRL+C on this window to copy to clipboard" wording confirms message-box-based reporting.
+* **Layer 0:** the stub unconditionally returns 0 after the warm-up (the "dummy" MessageBox path is a gated test hook). Failure modes are not handled — they are *designed to fail loudly*: the decoy block ends in `int3`, and misexecution would crash. **[CONFIRMED code]**
+* **Layer 1:** the aPLib depacker has **no error checking**; a corrupted stream silently produces garbage. The driver's only branch is the already-unpacked flag. **[CONFIRMED]**
+* **Restart helper (confirmed):** if `OpenProcess` fails it skips termination; `CreateProcessA` results are ignored; always ends with `ExitProcess(0)`. Its two call variants cover presence/absence of a third command-line token. **[CONFIRMED]**
+* **Runtime error handling of the kernel/application** (exception-based anti-debug, license-failure dialogs, etc.) is inside the encrypted/Virtualized layers — **UNKNOWN**. The static import of `MessageBoxA` and preserved Delphi exception machinery (exports) indicate dialog-based error reporting exists. **[INFERRED]**
 
 ---
 
 ## 21. Security-Relevant Behavior
 
-> Described technically. This is a **legitimate, code-signed commercial software protector**; the techniques below are its advertised function, not evidence of malicious intent. They are nonetheless the same techniques used by malware packers, which is why Themida-protected files routinely trigger heuristic AV detections.
-
-| # | Behaviour | Evidence | Confidence |
-|---|---|---|---|
-| 1 | **Self-modifying / dynamically generated code** — 28.3 MB decompressed into a writable section and executed | `.winlice` = `0xE0000060` RWX, `SizeOfRawData = 0`; `jmp eax` at `0x038F9204` | confirmed |
-| 2 | **ASLR and DEP disabled** | `DllCharacteristics = 0x0000` | confirmed |
-| 3 | **Encrypted payload** — 24.6 MB of code/data unreadable statically | entropy 7.89–7.99 on sections 0, 1, 2, 9, 10 | confirmed |
-| 4 | **Import-table concealment** | 20 DLLs, 33 functions, deliberately obscure names; real `.idata` encrypted | confirmed |
-| 5 | **Control-flow obfuscation** — fake return address, `jmp +0`, opaque predicates, dead code | `.text` disassembly | confirmed |
-| 6 | **Code mutation / flattening** in the engine | `0x02FA44B4` onwards | confirmed |
-| 7 | **Anti-emulation resource exhaustion** — 92,928 no-op API calls before real work | stub loops A/B/C × 3 | confirmed |
-| 8 | **Section-name wiping** | all content-bearing original sections have zeroed names | confirmed |
-| 9 | **Compiler/PDB-path leakage** — `Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb` | `.winlice+0x5DA0` | confirmed |
-| 10 | **Process termination and relaunch capability** — `OpenProcess(PROCESS_ALL_ACCESS)` + `TerminateProcess` + `CreateProcessA` | embedded stub at `.winlice+0x12EBA60` | confirmed |
-| 11 | **Licence / trial enforcement with registry and file persistence** | `Software\WinLicense`, `Activation…`, `trial_ext`, `license`, `TMLicenseA1.dat`, `extendkey.dat` | confirmed (artefacts) / inferred (mechanism) |
-| 12 | **Hardware fingerprinting** | `HWIn`/`HWIN` counters; `netapi32!NetWkstaGetInfo` preloaded | uncertain |
-| 13 | **Kernel-driver interaction** | `WinLicenseDriverVersion` string only; **no driver file or device path found** | uncertain |
-| 14 | **Manual DLL mapping support (XBundler)** with TLS emulation | `XBundlerTlsHelper.dll` + PDB path | strongly inferred |
-| 15 | **Runtime branch patching** | `.vm_sec`: 437 verified `jmp rel32` trampoline records | confirmed (data) / inferred (use) |
-| 16 | **Hook detection** | `HOOK_IN = %d` (`.winlice+0x130821C`) | strongly inferred |
-| 17 | **Debugger detection** | product documentation describes "DebuggerGuard" [2](https://www.oreans.com/ThemidaPad.xml); **no anti-debug code or API string was recovered in the accessible layers** | uncertain |
-| 18 | **Binary is code-signed and the digest verifies** | see [§4.3](#43-digital-signature--confirmed-and-verified) | confirmed |
-
-### Explicitly absent — **confirmed negatives**
-
-These were searched for exhaustively (ASCII + UTF-16, all sections, plus the decompressed 28.3 MB image) and **not found**:
-
-* Network endpoints of any kind (URL, hostname, IP literal, port constant).
-* Persistence mechanisms: `Run`/`RunOnce` keys, service names, `schtasks`, startup-folder paths, WMI subscriptions.
-* Credential handling: no `CredRead`/`CryptUnprotectData`/`LsaRetrievePrivateData` import or string; no browser/credential-store path.
-* Privilege escalation: manifest is `asInvoker`; no `AdjustTokenPrivileges`, `SeDebugPrivilege`, or `OpenProcessToken`.
-* Remote code injection: no `WriteProcessMemory`, `CreateRemoteThread`, `NtMapViewOfSection`, or `SetWindowsHookEx`.
-* Script interpreters, PowerShell, or LOLBin invocation.
-* Ransomware/wiper indicators: no crypto-API import, no file-extension list, no ransom-note text.
+1. **Heavy packing/virtualization (confirmed):** 74.9 MB VA footprint; RWX `.winlice` (29.7 MB) filled at runtime; original ~16.7 MB program encrypted at entropy 7.98; VM-protected protection logic. This defeats naive static analysis, AV unpacking, and patching.
+2. **Anti-analysis gauntlet at the entry point (confirmed mechanism, inferred intent):** ~66k API calls in tight loops before any real work — a timing/emulation burden. Additional decoy basic blocks, dead arithmetic, `int3` traps.
+3. **Anti-tamper structure (confirmed):** idempotency flag at `.winlice+0x12FD4B4`; EFLAGS captured into VM context (tamper detection inside the interpreter); "WL" marker strings for kernel self-location.
+4. **Import obfuscation (confirmed):** 1–2 functions per DLL across 20 DLLs; the true API surface is resolved at runtime from `.data` tables; IAT directory entry zeroed.
+5. **Fake data directory (confirmed):** delay-import directory filled with encrypted-looking bytes — hides configuration from parsers.
+6. **ASLR/DEP opt-out flags (confirmed):** `DllCharacteristics = 0` despite relocations — loads at fixed 0x400000 (compatibility with the protector's fixed-address fixups).
+7. **Credential/licensing handling (uncertain):** the string table contains `Пароль` (Password) and the import set includes fingerprinting APIs; actual license/credential logic is encrypted — **no plaintext credentials, keys, or C2 config were found**.
+8. **Authenticode (confirmed):** the file is validly signed by an individual Certum certificate. This gives strong integrity/attribution evidence for the artifact as-is, but says nothing about the encrypted payload's behavior.
+9. **Timing/environment-instruction census (rounds 2–3, §27.8/§28.3) [CONFIRMED counts]:** 76 `rdtsc`, 78 `cpuid`, 63 `int 2d`, and 8 `sidt`/`sgdt` instructions validated at instruction boundaries in the kernel/handler code (several `rdtsc` sites sit directly inside VM-handler sequences with VM-context access, incl. a dedicated timing VM handler at 0x1CB9F1F), plus the two anti-debug-associated APIs in the runtime-resolve list (`ImmSetCompositionWindow`, `ImageList_EndDrag`).
+10. **Operational caution:** because Layers 2–3 are unrecoverable statically, *any* statement that the program "only does X" at runtime is unjustified; executing it runs the full SecureEngine kernel with process rights. The sibling `test.exe` (Appendix A) is a game-cheat injector — handle both samples accordingly.
 
 ---
 
-## 22. Reverse-Engineering Evidence
+## 22. Reverse-Engineering Evidence Index
 
-### 22.1 Evidence index
-
-| # | Conclusion | Evidence | Label |
-|---|---|---|---|
-| E1 | Borland/Embarcadero linker | DOS sig `4D 5A 50` (`MZP`) at offset 0; stub text `This program must be run under Win32` at `0x50`; linker version 2.25 | **confirmed** |
-| E2 | 32-bit native PE32, GUI | `Machine = 0x014C`, `Magic = 0x010B`, `Subsystem = 2` | **confirmed** |
-| E3 | Themida/WinLicense protected | section names `.winlice` (RVA `0x018A7000`), `.boot` (`0x034F9000`), `.vm_sec` (`0x01891000`) | **confirmed** |
-| E4 | Protector = Themida 3.2.4.52, Oreans | `RT_VERSION` string table `040904E4` | **confirmed** |
-| E5 | Oreans build tree | PDB path at `.winlice+0x5DA0`: `Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb` | **confirmed** |
-| E6 | Stub built from an Oreans DLL template | `.data:0x04E7C282 = "skeleton.dll"`, `0x04E7C28F = "TestHello"` | **confirmed** |
-| E7 | Entry transfers via faked return | `mov eax,0x038F9058` @ `04E7D00C`; `push eax` @ `04E7D011`; `push ebp/mov ebp,esp` @ `04E7D017`; `leave/ret 0xC` @ `04E7D15A` | **confirmed** |
-| E8 | `.boot+0x5D` is an aPLib depacker | `mov dl,0x80` @ `038F9068`; `add dl,dl / jne / mov dl,[esi] / inc esi / adc dl,dl` bit reader; tag dispatch `0`/`10`/`110`/`111`; `cmp eax,0x7D00`, `cmp eax,0x500`, `cmp eax,0x7F` length adjustments | **confirmed** |
-| E9 | Decompression target is `.winlice` | `0x34F9058 − 0x1C52058 = 0x018A7000` = `.winlice` RVA exactly | **confirmed** |
-| E10 | Reconstruction is exact | 32 streams × `0xE2900` = `0x1C52000` = `.winlice` `VirtualSize`; input consumed `0x1582BE1` of `0x1582C00` | **confirmed** |
-| E11 | Engine entry = VA `0x02FA44B4` | `mov eax,0x12FD4B4` @ `038F91F7`; `add eax,ebx`; `jmp eax` @ `038F9204` | **confirmed** |
-| E12 | Engine code is mutated | disassembly at `0x02FA44B4`: block scatter, dead arithmetic, `ebp`-relative context, `xor word [esi],cx` | **confirmed** |
-| E13 | `.vm_sec` = 5-byte `jmp` registry | 437 contiguous records, `end−start == 5` for all, first byte `0xE9` for 437/437, all targets inside `.winlice` | **confirmed** |
-| E14 | `XBundlerTlsHelper.dll` embedded | valid MZ/PE at `.winlice+0x56F0`; `ImageBase 0x10000000`; TLS dir `0x10006004`; imports only `Sleep` | **confirmed** |
-| E15 | Relaunch stub embedded | valid MZ/PE at `.winlice+0x12EBA60`; imports `OpenProcess`, `TerminateProcess`, `CreateProcessA`, `GetCommandLineA`, `GetStartupInfoA`, `Sleep`, `ExitProcess`; full disassembly recovered | **confirmed** |
-| E16 | Payload is Delphi/RAD Studio | exports `__dbk_fcall_wrapper`, `dbkFCallWrapperAddr`, `TMethodImplementationIntercept` — the documented default RAD Studio exports [4](https://en.delphipraxis.net/topic/330-how-to-remove-default-dll-exports-delphi-rio/) | **confirmed** |
-| E17 | Payload links madExcept | export `madTraceProcess` @ RVA `0x000B0CBC` | **confirmed** |
-| E18 | Original module name `Themida.exe` | `.edata` Name RVA `0x01890028`; directory size `0xB3` == original `.edata` VSize `0xB3` (byte-exact copy) | **confirmed** (data) / **strongly inferred** (conclusion) |
-| E19 | Original section layout reconstructed | DELAY_IMPORT dir `0x0103C000`/`0xB34` == section 5 VA/VSize; EXPORT size `0xB3` == section 6 VSize; `.bss`/`.tls` names survive iff `SizeOfRawData == 0` | **strongly inferred** |
-| E20 | Signed by Oreans' principal | leaf subject `Rafael Patricio Ahucha Ruiz`, Jerez de la Frontera, Cádiz, ES; registrant of oreans.com [1](https://website.informer.com/Rafael+Ahucha+Oreans+Technologies.html) | **confirmed** (cert) / **strongly inferred** (link) |
-| E21 | File unmodified since signing | computed Authenticode SHA-256 `27CE…0797` == `SpcIndirectDataContent` digest; PE `CheckSum` also valid | **confirmed** |
-| E22 | Protection project `Themida64_GUI` | UTF-16 at `.winlice+0x4CD40` and `+0x1339F94`, in the `WLProjectName` data region | **strongly inferred** |
-| E23 | Protection performed 2025-10-10 | PE stamp 09:24:29 UTC; UTF-16 `Fri Oct 10 11:25:48 2025` @ `.winlice+0x1EA4`; `signingTime` 09:25:29 UTC | **confirmed** |
-| E24 | No TLS callbacks | `IMAGE_TLS_DIRECTORY.AddressOfCallBacks = 0` @ RVA `0x0189A668` | **confirmed** |
-| E25 | Payload TLS is Delphi threadvars | TLS raw block `0x654` bytes == original `.tls` VSize `0x654`; entirely zero | **confirmed** |
-| E26 | No overlay | cert at `0x01F55E58` + `0x2870` = `0x1F586C8` = file size | **confirmed** |
-| E27 | Payload not aPLib-only | depacking section 0's raw data fails at byte 1 (`bad off 607`) | **confirmed** |
-| E28 | No network capability in the protector | exhaustive ASCII+UTF-16 scan of all sections and the 28.3 MB image found zero URLs/hosts/IPs; no networking imports beyond the `wsock32` placeholder | **confirmed** |
-
-### 22.2 Key addresses quick reference
-
-| Address | Meaning |
+| Finding | Evidence (address / artifact) |
 |---|---|
-| `0x04E7D000` | PE entry point (protector stub) |
-| `0x04E7C079` | junk-loop counter (`.data`) |
-| `0x04E7D15B` | `ret 0xC` — the real transfer instruction |
-| `0x038F9058` | `.boot+0x58` — fake-return target |
-| `0x038F905D` | `aP_depack` |
-| `0x038F91A8` | `BootMain` |
-| `0x038F91B4` | `mov ecx, 0x01C52058` — the `.winlice` delta constant |
-| `0x038F91C3` | re-entrancy guard test |
-| `0x038F9204` | `jmp eax` into the engine |
-| `0x02FA44B4` | SecureEngine entry (`.winlice+0x12FD4B4`) |
-| `.boot+0x206` | stream count byte (`0x20`) |
-| `.boot+0x207` | first aPLib stream |
-| `.winlice+0x56F0` | embedded `XBundlerTlsHelper.dll` |
-| `.winlice+0x12EBA60` | embedded relaunch stub |
-| `.winlice+0x13D968C` | bug-check report template |
-| RVA `0x01891000` | `.vm_sec` fixup table |
-| RVA `0x0189A668` | TLS directory |
-| file `0x01F55E58` | Authenticode blob |
+| PE32 i386 GUI, EP RVA 0x4A7D000 | Optional header (objdump/pefile), §2.1 |
+| 21 sections incl. `.winlice`/`.boot`/`.vm_sec`, blank names | Section table, §2.2 |
+| Themida/WinLicense 3.2.4.52 | RT_VERSION strings (`.rsrc` RVA 0x18A667C) |
+| Original = Delphi, internal name "Themida.exe" | Export dir `.edata` (file 0x9BD800): name RVA 0x1890028; exports `__dbk_fcall_wrapper` etc.; `MAINICON` |
+| Valid Authenticode, signer identity, timestamp | PKCS#7 at file 0x1F55E58; OpenSSL parse; **digest recomputation match** (§2.4) |
+| Link time 09:24:29Z vs signing 09:25:29Z | PE TimeDateStamp 1760088269 vs UTCTIME `251010092529Z` |
+| EP warm-up loops and exact counts | Disassembly 0x4E7D01F–0x4E7D0F7; constants 0x800/0x1300/0x1800 and outer counter @0x4E7C079 |
+| `0xAB4130` magic + "dummy" MessageBox chain | Disassembly 0x4E7D0FD–0x4E7D155; strings at 0x4E7C048–0x4E7C065 |
+| Decoy block, `0xBEEFAD01`, "WL  " markers, `int3` | Bytes at 0x4E7D15E–0x4E7D210 (file 0x1F5595E+) |
+| Return-trampoline into `.boot`, stack preservation | `push [esp+0xC]`×3, `mov eax,0x38F9058`, `ret 0xC` (0x4E7D000–0x4E7D012, 0x4E7D15B) |
+| `.winlice` base derived from return address | `sub ebx,5; sub ebx,0x1C52058` at 0x38F91AF–0x38F91B9 |
+| Idempotency flag / VM entry at +0x12FD4B4 | `cmp dword [eax],0` at 0x38F91C3; `jmp eax` at 0x38F9204; target VA 0x2FA44B4 |
+| 32 aPLib blocks × 928,000 B | Byte 0x20 @ file 0x9D2A07; offline unpack reproduced all 32 blocks; total = 0x1C52000 = `.winlice` VSize |
+| aPLib identity of depacker | Threshold constants 0x7D00/0x500/0x7F at 0x38F914C–0x38F916B; successful depack |
+| VM interpreter mechanics | Disassembly at 0x1CA7000+ and 0x2FA44B4 region (EBP-context, `jmp edx`/`jmp esi` dispatch, table at ctx+0x38) |
+| Encrypted VM program vs handler code | Entropy profile of unpacked image (§8.3) |
+| `XBundlerTlsHelper` DLL + PDB path | Carved PE at unpacked +0x56F0; CodeView record `RSDS…Z:\Development\SecureEngine\src\plugins_manager\...` |
+| Restart-helper behavior | Carved PE at +0x12EBA60; disassembly 0x401000–0x40114D (Appendix B hashes) |
+| `.vm_sec` = pointer pairs into `.winlice` | Dwords at file 0x9BDA00+ (e.g. 0x018AFAE0/0x018AFAE5) |
+| Fake delay-import dir | Raw descriptors at RVA 0x103C000 (file 0x5BFA00) |
+| Import bootstrap tables / skeleton.dll / TestHello | `.data` dump 0x4E7C128–0x4E7C296 |
+| **R4:** manual export resolver (walk → prefilter → strlen → hash → compare) | Executed under Unicorn; sites 0x1CA817A, 0x1CAAC8D, 0x307E4D5, 0x2F8FC65→0x1D040A0 (`tools/emu/logs/emu_hashrows.txt`) |
+| **R4:** name hash = CRC-16-style, poly 0x5041, NUL included | `tools/emu/wloracle.py` — 124/124 validation vs runtime pairs |
+| **R4:** 152 runtime-resolved APIs incl. `IsWow64Process2` | `tools/emu/logs/emu_hashrows.txt`, `emu_thunkres.txt` |
+| **R4:** init sequence to 320 M insns (VirtualProtect×106, tokens, SETUPAPI) | `tools/emu/logs/emu_result.json` API census |
+| **R4:** backward `\`/`/` path scan of module filename | `cmp word [edx],cx` @0x1CC65A1 over the `GetModuleFileNameW` buffer (`tools/emu/logs/emu_scan.txt`) |
+| Russian string table / dummy dialogs | Resources §19 |
+| test.exe is a separate injector, not embedded | Negative byte-search of `test.exe` and its sections inside `Test2.exe`; different arch/toolchain |
+| **R2 — no standard crypto constants in kernel** | Byte-searches for AES/SHA/MD5/Blowfish/RC5/RC6/ChaCha/base64 constants over all 29,696,000 unpacked bytes (§27.1) |
+| **R2 — standard CRC32 table at VA 0x305DCBC** | Byte-exact match of 1024-byte reflected table; earlier hit at +0x13B6EBC = table[128] (§27.1) |
+| **R2 — golden-ratio/TEA constant 0x9E3779B9 ×8** | Disassembly at unpacked+0x3CF9A, +0x12F4DC7, +0x132669E, +0x1338C6B, +0x1394EA5, +0x13BA15D, +0x141E8DD, +0x1472D39 (§27.1) |
+| **R2 — WinLicense licensing strings** | Kernel strings/UTF-16 dump: keys at 0x1CAB28C/0x2FC6478/0x305E1C4/0x303DA3C/0x305DAB8/0x3062E44; `TMLicenseA1.dat` 0x303E010; `extendkey.dat` 0x303D5EC (§27.2) |
+| **R2 — engine build `Themida64_GUI`, `Fri Oct 10 11:25:48 2025`** | UTF-16 strings at unpacked+0x4CD40/+0x1339F94 and +0x1EA4 (§27.3) |
+| **R2 — kernel debug strings PROC_IN/TP_IN/CHECK_OUT** | Format strings at 0x1CBD618/0x1CD67E4/0x1CDAB3C/0x1CEDDA0 (§27.3) |
+| **R2 — command-line switches** | Isolated strings `/nosplash` 0x1CAAD34, `/dis1` 0x1CABFDC, `/dumpstatus` 0x1CDB588, `/skipactivexreg` 0x1CF30F0, `/showcode2` 0x1D0A31C, `/dmtc` 0x1D60297, `/checkprotection` 0x303F5AC (§27.4) |
+| **R2 — `.vm_sec` = 685 jump-slot pairs** | Two runs (entries 0–436, 1903–2150); all 685 X values verified as `E9` opcode; target histogram 243/65/377 (§27.5) |
+| **R2 — exact `.data` runtime API table (14 entries)** | Hint/name parse at 0x4E7C128–0x4E7C24A (§27.6) |
+| **R2 — second VM interpreter at 0x2FA44B4** | Disassembly: bytecode IP ctx+0x6C, opcode XOR key ctx+0xC8, rolling state ctx+0xD8, handler index −0xF442 (§27.7) |
+| **R2 — rdtsc×76 / cpuid×78 / int2d×63 / sidt·sgdt×8** | Instruction-boundary-validated census over the unpacked kernel (§27.8) |
+| **R2 — no hidden overlay** | Last section raw end 0x1F55E54; certificate spans 0x1F55E58–0x1F586C8; nothing else follows (§27.9) |
+| **R3 — 685 unique VM handlers classified** | Symbolic-disassembly census; ctx read/write frequency table (§28.1–28.2) |
+| **R3 — rdtsc VM handler at 0x1CB9F1F; 4 native-call handlers → helpers 0x1CE2763/0x2F8F5A6** | Disassembly with args (0, 0xC/0xE0) (§28.3) |
+| **R3 — zero 256-byte permutation windows (no S-boxes)** | Full-image scan of 29,696,000 bytes (§28.4) |
+| **R3 — leftover `.vm_sec` records and delay-import blob are encrypted** | Flat value histograms; per-record entropy 4.25–5.00; no positional structure; XOR probes negative (§28.5–28.6) |
 
 ---
 
-## 23. Confirmed vs Inferred Findings
+## 23. Confirmed vs. Inferred Findings (summary table)
 
-### Confirmed (directly evidenced by bytes in the file)
-
-1. PE32 / i386 / GUI, `ImageBase 0x400000`, EP RVA `0x04A7D000`, 21 sections, `MZP` DOS signature.
-2. ASLR, DEP and SEH-hardening flags are all off (`DllCharacteristics = 0`).
-3. Themida/WinLicense **3.2.4.52** by **Oreans Technologies** (version resource + `.winlice`/`.boot`/`.vm_sec`).
-4. Authenticode: signed by `Rafael Patricio Ahucha Ruiz`, SHA-256/RSA-4096, Certum chain, `signingTime` 2025-10-10 09:25:29 UTC, **digest verified**, no overlay.
-5. The complete entry-stub disassembly, including the fake-return transfer, the three-pass junk loop, the three dead `MessageBoxA` branches, the `"WL  "` / `0xDEADBE01` / `0xDEADBE02` patch markers, and `skeleton.dll` / `TestHello`.
-6. `.boot` structure: 40-byte header, trampoline at `+0x58`, aPLib depacker at `+0x5D`, driver at `+0x1A8`, stream table at `+0x206` with count `0x20`.
-7. The aPLib algorithm and every length-adjustment threshold (32000 / 1280 / 127).
-8. The decompression result: 32 × `0xE2900` = `0x1C52000` bytes, exactly `.winlice`'s virtual size.
-9. Engine entry at VA `0x02FA44B4`; its code is mutated/flattened with an `ebp`-relative context.
-10. `.vm_sec`: 437 contiguous `{start, start+5}` records, all pointing at `E9 jmp rel32` inside `.winlice`, all targets inside `.winlice`.
-11. `XBundlerTlsHelper.dll`: full PE metadata, PDB path, and complete `DllMain`.
-12. The relaunch stub: full disassembly and reconstructed C for `main`, `extract_quoted`, `atoi_signed`, `strcat`.
-13. All recovered strings: 16 command-line switches, 5 registry key paths, 13 value names, 2 licence filenames, the bug-check report template, 8 counter format strings.
-14. Payload exports: `TMethodImplementationIntercept`, `__dbk_fcall_wrapper`, `dbkFCallWrapperAddr`, `madTraceProcess`; export module name `Themida.exe`; export directory is a byte-exact copy (`0xB3`).
-15. TLS directory has **no** callbacks; TLS raw block is `0x654` zero bytes.
-16. `.reloc` contains only 34 entries (32 `HIGHLOW` + 2 `ABSOLUTE` padding), all for the stub and the TLS pointers.
-17. The payload's 11 sections are encrypted (entropy 6.89–7.99) and are **not** plain aPLib.
-18. Build-time correlation across three independent timestamps within ~80 seconds on 2025-10-10.
-
-### Strongly inferred (multiple independent, mutually consistent indicators)
-
-1. **The payload is Oreans' own `Themida.exe` v3.2.4.52, protected with itself.** Basis: version resource + export module name (byte-exact copy of the original) + Oreans-owned signing certificate with a verified digest + matching protector version + Delphi/madExcept toolchain matching Themida's known implementation + protection project named `Themida64_GUI`.
-2. **The payload is a Delphi XE2-or-later Win32 VCL application** with madExcept, ~16.0 MB of code and ~6.8 MB of resources.
-3. **The original section layout** is `.text .itext .data .bss .idata .didata .edata .tls .rdata .reloc .rsrc` (two exact directory-size matches plus the name-survival rule).
-4. **The junk loops are an anti-emulation device** — they produce 92,928 API calls with provably zero functional effect.
-5. **`.vm_sec` is a runtime branch-patching / integrity registry.**
-6. **`XBundlerTlsHelper.dll` supplies TLS infrastructure for manually mapped bundled DLLs** (XBundler feature).
-7. **The relaunch stub implements "restart the application"** (post-activation / trial-extension / fault recovery).
-8. **The 20-DLL import list mirrors the payload's real dependency set**, revealing a full-featured VCL desktop application.
-9. **The bug-check counters are paired entry/exit guards** whose divergence signals tampering.
-10. **`Software\MyCompany\MyProduct` and `Software\Company\Product` are unmodified project defaults.**
-
-### Uncertain / speculative (flagged as such)
-
-1. The provenance of the Russian `RT_STRING` database-connection vocabulary and the four sampler `RT_DIALOG`s.
-2. Whether a WinLicense **kernel driver** is actually used at runtime (only a version-string reference exists).
-3. Whether the engine **writes** to the registry (only read APIs are visible).
-4. Whether the relaunch stub is **dropped to disk** or mapped in memory, and its drop path.
-5. The exact semantics and parsing rules of the 16 command-line switches.
-6. Whether the `mov bx,ds; test bl,4` probe in the relaunch stub is an intentional environment check.
-7. Whether SecureEngine creates worker threads (`TP_IN` hints at "thread protection", no code recovered).
-8. Whether this is `Themida.exe` or the `Themida64` GUI variant (version resource says `OriginalFilename = Themida` and the export name is `Themida.exe`, but the project is named `Themida64_GUI`).
-9. The specific anti-debug techniques implemented — advertised by the vendor, but none observable in the accessible layers.
+| Conclusion | Confidence |
+|---|---|
+| File identity, hashes, PE structure, 21 sections | **Confirmed** |
+| Protected with Oreans SecureEngine (Themida/WinLicense) v3.2.4.52 | **Confirmed** (version resource + structural fingerprint + SecureEngine PDB after unpacking) |
+| Authenticode signature valid and covers the exact file; signer = individual Certum cert; signed 2025-10-10 09:25:29Z | **Confirmed** (cryptographic verification) |
+| Entry-point behavior: trampoline, 3×3 warm-up loops, `0xAB4130` check, return into `.boot` | **Confirmed** (disassembly + arithmetic) |
+| `.boot` decompresses 32 aPLib blocks (22.5 MB → 29.7 MB) into `.winlice`, then jumps to +0x12FD4B4 | **Confirmed** (disassembly + successful offline reproduction) |
+| `.winlice` contains a bytecode VM (encrypted dispatch, handler tables, key-evolving decode) | **Confirmed mechanics**; identification as "the Themida VM" is strongly inferred |
+| Original program is a Delphi application self-identifying as Themida.exe 3.2.4.52 | **Strongly inferred** (exports, MAINICON, version block — all preserved artifacts of the original) |
+| Original program's code/data remain encrypted on disk (sections 0–10) | **Confirmed** (entropy/structure); their decryption at runtime is **strongly inferred** |
+| Embedded DLL is the XBundler TLS helper (loads with bundled DLLs; `Sleep(1)` no-op) | DLL content **confirmed**; its runtime role **strongly inferred** |
+| Embedded EXE kills a PID and respawns a program | **Confirmed** (fully reversed); when it is used is **inferred** |
+| Warm-up loops are anti-emulation/timing defenses | **Inferred** (mechanism confirmed; intent not provable) |
+| Delay-import directory = encrypted configuration | **Strongly inferred** |
+| WinLicense licensing/machine-fingerprint checks run inside the VM | **Inferred** (imports + markers); logic **unknown** |
+| No network C2, no persistence mechanism, no dropped files | **No evidence found** in all recoverable plaintext — but encrypted layers remain unaudited (**uncertain**, not "confirmed absent") |
+| Ownership of dummy dialogs / Russian strings | **Uncertain** |
+| **R2:** `.vm_sec` pairs are consecutive 5-byte `jmp` slots (685/685 verified) | **Confirmed** (byte/opcode verification); purpose (bridge/patch registry) **inferred** |
+| **R2:** Kernel crypto = custom (CRC32 + golden-ratio/TEA-style mixing, no standard primitives) | **Confirmed** constants/censuses; exact cipher **unknown** |
+| **R2:** WinLicense licensing layer present (registry keys, `TMLicenseA1.dat`, `extendkey.dat`) | **Confirmed** strings; runtime logic **inferred** |
+| **R2:** Engine build identity `Themida64_GUI`, kernel built 2025-10-10 | **Confirmed** strings |
+| **R2:** Protected app accepts engine switches (`/nosplash`, `/dumpstatus`, `/checkprotection`, …) | **Confirmed** strings; exact behavior **inferred** |
+| **R2:** Second (mutated) VM interpreter at kernel entry 0x2FA44B4 with per-opcode XOR-decryption | **Confirmed** mechanics; key schedule **not reconstructed** |
+| **R2:** 76 `rdtsc` / 78 `cpuid` / 63 `int 2d` / 8 `sidt`·`sgdt` in kernel code | **Confirmed** counts; anti-debug/anti-VM intent **inferred** |
+| **R2:** No hidden overlay data | **Confirmed** (byte accounting) |
+| **R3:** 685 unique VM handlers; ~380 update the rolling opcode key; 127 reference the ctx+0x38 dispatch table; 210 touch EFLAGS | **Confirmed** (685/685 classified); class names **inferred** |
+| **R3:** VM instruction set includes a timing (`rdtsc`) instruction and native-call instructions into kernel helpers | **Confirmed** code; semantics **inferred** |
+| **R3:** Cipher layer is ARX-style — zero S-boxes / substitution tables in the entire kernel | **Confirmed** (full-image permutation scan) |
+| **R3:** Leftover `.vm_sec` records and delay-import blob are properly encrypted (no static shortcut) | **Confirmed** statistics; contents **unknown** |
+| **R4:** WinLicense kernel resolves its imports by walking export tables itself (first-char prefilter → strlen → rolling hash → compare) | **Confirmed** (executed under emulation; all code sites identified) |
+| **R4:** Name-hash algorithm fully reconstructed (CRC-16-style, polynomial 0x5041, NUL byte included) and reproduced offline — 124/124 validation | **Confirmed** |
+| **R4:** The kernel's runtime API set = 152 unique names (incl. registry, Toolhelp32, SID/ACL, token, message-pump, file-mapping clusters) | **Confirmed** (observed resolutions) |
+| **R4:** The engine probes `IsWow64Process2` (Windows 10 API) before `IsWow64Process` | **Confirmed** (hash-matched resolution) — corroborates the 2025-10-10 build date |
+| **R4:** Kernel initialization: 106× VirtualProtect, token/admin checks, file probing, `LoadLibraryA("SETUPAPI.DLL")` | **Confirmed** (API census at 320 M instructions) |
+| **R4:** Original code sections still fully encrypted at the 320 M frontier (0 dirty pages); OEP not reached | **Confirmed** (page-dirty tracking) |
 
 ---
 
 ## 24. Unknowns and Limitations
 
-### 24.1 Not recovered, with reasons
+**Could not be recovered, and why:**
 
-| Unknown | Why |
-|---|---|
-| **The payload's entire code** (16.0 MB `.text`) | Encrypted in place (entropy 7.985). The key is derived at runtime inside mutated SecureEngine code. Not plain aPLib (verified). |
-| **The payload's resources** (6.8 MB) | Same encryption. All VCL `.dfm` form definitions, bitmaps, and string tables are inaccessible, so the application's UI cannot be described. |
-| **The payload's real import table** (23 KB) | Encrypted; only the 20-DLL preload hint set is visible. |
-| **The payload's original entry point (OEP)** | Computed at runtime by the engine; no static reference exists. |
-| **All payload features, algorithms, and business logic** | Direct consequence of the three items above. Section [12 B](#b--payload-application-features--not-recoverable) states this explicitly. |
-| **SecureEngine's algorithms** (licence validation, HWID derivation, anti-debug, anti-dump, VM) | The 28.3 MB image was decompressed successfully, but its code is mutated and control-flow-flattened, with additional layers decrypted only in memory. Only ~900 "wordy" strings survive across 28.3 MB; regions above `.winlice+0x60000` are largely still encrypted (entropy 7.2–7.4). |
-| **The payload decryption key/cipher** | Never present in the file; derived at runtime. |
-| **`.vm_sec`'s exact runtime semantics** | The table's format is proven; its consumer is inside mutated code. |
-| **Registry hive (HKCU/HKLM) and full key paths** | Only relative subkey strings recovered; the root and any `RegOpenKeyEx` call site are in mutated code. |
-| **Licence-file search paths** | Only bare filenames recovered. |
-| **Mutex / event / named-object names** | None found; likely generated at runtime. |
-| **Actual network behaviour** | None evidenced; cannot prove a negative for the encrypted payload. |
-| **Exact API call sequence at runtime** | No execution environment was available. |
+1. **The original application's code and data** (~16.7 MB, sections 0–10). Encrypted with runtime-derived keys; the decryption routine lives in the VM kernel. Recovery would require dynamic execution (or a full VM devirtualization), neither possible in this static, Linux-only environment.
+2. **The SecureEngine kernel's actual control flow after entry at 0x2FA44B4** — handler semantics, check sequences, OEP computation, import rebuilding, license validation. The VM program regions (+0x60000–+0x280000, +0x1C20000+) remain encrypted even after the aPLib stage; round 2 decoded the interpreter mechanics of a second entry-level VM (§27.7) but not the bytecode itself, because every 16-bit opcode is XOR-decrypted with an evolving key whose schedule is itself mutated per interpreter instance.
+3. **Which runtime APIs the kernel resolves** (beyond the 14-entry `.data` list, §27.6) and their call sites.
+4. **The contents of the fake delay-import configuration blob** (RVA 0x103C000).
+5. **The trigger conditions for the embedded restart helper and the bundled `skeleton.dll`/`TestHello`** — i.e., what the protected test application actually *does*.
+6. **The meaning of magic constants** `0xAB4130`, `0xBEEFAD01`, `0x54EC56B9`; the indexing base of the `.data` small-dword tables (best candidate: RVAs into the encrypted original import area — untestable while section 0 is encrypted); and the 1452 non-`+5` `.vm_sec` records (§27.5).
+7. **Any runtime side effects** (files written, registry keys read, processes/threads created, network traffic) — **no execution evidence exists**; §14–§17 are import-based inferences only.
+8. **Whether VM bytecode contains further embedded payloads** beyond the two PEs recovered.
 
-### 24.2 Methodological limitations
+**Resolved by round 2 (§27):** no hidden overlay (§27.9); `.vm_sec` pair semantics (§27.5); kernel crypto inventory (§27.1); licensing key/file names (§27.2); engine build identity and kernel build date (§27.3); seven embedded command-line switches (§27.4); the exact runtime API resolve list (§27.6); instruction-level anti-analysis census (§27.8).
 
-1. **Static analysis only.** No Windows host, debugger, emulator, or sandbox was available. Every claim about runtime behaviour is derived from recovered instructions or strings, never from observation. No API trace, no file/registry trace, no packet capture, and no memory dump exists for this analysis.
-2. **Anti-analysis by design.** Themida is a commercial protector explicitly engineered to defeat static reconstruction. Layers 1 and part of 2 were defeated; the rest is intact by design.
-3. **No symbols for the payload.** Only 4 exported names (3 of which are compiler defaults). No PDB, no debug directory for the payload, no import names.
-4. **Encrypted-at-rest engine.** Even after decompressing `.winlice`, the majority of the image is a second encryption layer. Strings and two embedded PEs survived because they are stored plainly *within* the compressed stream; executable regions are not.
-5. **No reference sample.** No unprotected build of the payload, and no other Themida 3.2.4.x binary, was available for differential analysis. Distinguishing "protector template resources" from "payload resources" therefore relies on internal consistency alone — the direct cause of uncertainty item 1 in [§23](#uncertain--speculative-flagged-as-such).
-6. **The other file in the repository (`test.exe`, 613,376 bytes) is unrelated** — an x86-64 MSVC binary (`MZ\x90`, machine `0x8664`, 6 sections, MSVCP140/VCRUNTIME140 imports, built 2025-09-06). It shares no code, compiler, architecture, or resources with `Test2.exe` and was not used in this analysis.
+**Resolved by round 3 (§28):** classification of all 685 VM handlers into archetypes; refined VM-context field map (read/write census); identification of the timing and native-call VM instructions; proof that the cipher is ARX-style with no S-boxes; statistical confirmation that the leftover `.vm_sec` records and the delay-import blob are properly encrypted (no static shortcut).
 
-### 24.3 What would be required to go further
+**Resolved by round 4 (§29 — dynamic emulation):** item 3 in full — the kernel's runtime API set (152 unique names, observed by hash-validated export resolutions); the complete mechanics, hash algorithm, and dispatch path of the manual export resolver; the initialization API sequence up to the decryption staging area (VirtualProtect storm, token/admin checks, SETUPAPI load attempt); confirmation that `IsWow64Process2` is probed (modern-Windows-aware engine build). Partially advanced: item 7 (observed runtime calls: registry opens, file-attribute queries, directory changes, environment-variable writes — no file writes or network activity observed so far).
 
-| Goal | Requirement |
-|---|---|
-| Recover the payload | Run under Windows and dump the process after OEP is reached; rebuild imports (Scylla/ImpREC-class tooling). |
-| Understand SecureEngine | Kernel-level or hypervisor-level tracing to observe the engine after each self-decryption stage. |
-| Devirtualise the mutated code | A dedicated Themida 3.x devirtualiser, or symbolic execution over the recovered `.winlice` image. |
-| Confirm the driver question | Runtime enumeration of loaded kernel modules and `\Device\` objects. |
-| Resolve the resource-provenance question | Compare against a known-good Themida 3.2.4.52 installation, or against other files protected with the same version. |
+**Methodological limitations:** rounds 1–3 were static-only. Round 4 added full CPU emulation (Unicorn) of the unpacked kernel in a synthetic Windows environment — the sample was never run on real Windows. Items 1, 2, 4, 5, 6, 8 still require either deeper emulation (shim fidelity for SETUPAPI and file/token APIs, five remaining name brute-forces) or a real Windows sandbox with anti-anti-debug.
 
 ---
 
-## 25. Reconstructed Execution Flow
+## 25. Reconstructed Execution Flow (end-to-end narrative)
 
-```mermaid
-flowchart TD
-    A["CreateProcess Test2.exe"] --> B["Loader: map 21 sections<br/>.winlice is 28.3 MB zero-filled RWX"]
-    B --> C["Loader: bind 20 DLLs and 33 IAT slots"]
-    C --> D["Loader: manifest - ComCtl6, dpiAware, asInvoker"]
-    D --> E["Loader: TLS dir 0x0189A668<br/>AddressOfCallBacks is 0, nothing runs"]
-    E --> F["Loader: apply 32 HIGHLOW relocations"]
-    F --> G["EIP = 0x04E7D000"]
-
-    G --> H["push fake return 0x038F9058<br/>then build frame"]
-    H --> I{"junk counter at 0x04E7C079<br/>still below 3 ?"}
-    I -->|yes| J["loop A x2048: GetModuleHandleA, LoadLibraryA,<br/>FreeLibrary, VirtualAlloc, VirtualFree"]
-    J --> K["loop B x4864: GetModuleHandleA, VirtualAlloc, VirtualFree"]
-    K --> L["loop C x6144: GetModuleHandleA"]
-    L --> M["inc counter"] --> I
-    I -->|no| N{"fdwReason equals 0xAB4130 ?<br/>three opaque tests"}
-    N -->|always no| O["mov eax,0 then leave then ret 0xC"]
-    N -.-> P["MessageBoxA dummy<br/>UNREACHABLE"]
-
-    O --> Q["EIP = 0x038F9058"]
-    Q --> R["call 0x038F91A8 then pop EIP<br/>to self-locate"]
-    R --> S["base = VA of .boot+0x58 minus 0x1C52058<br/>resolves to .winlice at RVA 0x018A7000"]
-    S --> T{"guard dword at base+0x12FD4B4<br/>equals zero ?"}
-    T -->|no| X["skip decompression"]
-    T -->|yes| U["read count byte 0x20 at .boot+0x206"]
-    U --> V["32 x aP_depack, 0xE2900 bytes each"]
-    V --> W["total 0x1C52000 bytes written into .winlice"]
-    W --> X
-    X --> Y["jmp base+0x12FD4B4, i.e. 0x02FA44B4"]
-
-    Y --> Z["SecureEngine: mutated and flattened,<br/>ebp-relative context, in-place XOR"]
-    Z --> AA["decrypt payload sections 0 to 10 in place"]
-    Z --> AB["apply payload .reloc, 1.5 MB"]
-    Z --> AC["rebuild payload IAT, 23 KB"]
-    Z --> AD["restore payload resources, 6.8 MB"]
-    Z --> AE["licence / integrity / environment checks"]
-
-    AE -->|pass| AF["jmp original Delphi entry point<br/>RVA unknown"]
-    AE -->|fail| AG["bug-check MessageBox with<br/>CheckIN / CheckOUT counters, or relaunch stub"]
-
-    AA --> AF
-    AB --> AF
-    AC --> AF
-    AD --> AF
-
-    AF --> AH["Delphi RTL init, .itext unit initialization"]
-    AH --> AI["TApplication Initialize, CreateForm, Run"]
-    AI --> AJ["VCL message loop - APPLICATION ACTIVE"]
-
-    style Z fill:#5b2333,color:#fff
-    style AA fill:#5b2333,color:#fff
-    style AF fill:#5b2333,color:#fff
-    style AJ fill:#1f4d2e,color:#fff
-    style P fill:#444,color:#bbb
-```
-
-Red = recovered in outline only (mutated/encrypted). Green = the point at which "the main application functionality becomes active".
-
-### Data-flow view
-
-```
- .boot  +0x207 ─────────┐
- (21.5 MB, 32 streams)  │  aP_depack x32
-                        ▼
- .winlice  0x018A7000 ──┬──> 0x0000 .. 0x60000   loader code + XBundlerTlsHelper.dll
- (28.3 MB RWX)          ├──> 0x12EBA60           relaunch stub PE
-                        ├──> 0x1300000..0x1400000 runtime string pool
-                        └──> 0x12FD4B4           ENGINE ENTRY  (VA 0x02FA44B4)
-                                   │
- .vm_sec 437 records ──────────────┤ (5-byte jmp trampoline registry)
-                                   │
-                                   ▼
- payload sections 0..10 ─── decrypt in place ───> executable Delphi image
- (raw 9.7 MB, virtual 24.6 MB)                    RVA 0x1000 .. 0x188F4E8
-                                   │
- registry Software\WinLicense ─────┤
- TMLicenseA1.dat / extendkey.dat ──┤ (licence inputs, paths unknown)
- command line /nosplash /forcerun ─┘
-```
+1. `CreateProcess("Test2.exe")` → loader maps 74.9 MB VA, resolves 20 DLLs/33 functions, applies 34 relocations, allocates TLS (index at 0x1C9A658; no callbacks).
+2. **EP 0x4E7D000**: builds the forged-return frame; runs 3 rounds × (2,048 full-API iterations + 4,864 alloc iterations + 6,144 handle iterations); checks stack value against `0xAB4130`; returns 0 via `ret 0xC`, landing exactly on `0x38F9058` with the original loader stack restored.
+3. **0x38F9058 → 0x38F91A8 (driver)**: self-locates `.winlice` (0x1CA7000); sees the flag at +0x12FD4B4 is 0; loops 32 times over the aPLib stream at `.boot+0x206`, decompressing 928,000 bytes per block into `.winlice` (total 29,696,000 bytes); jumps to **0x2FA44B4**.
+4. **VM kernel**: initializes an EBP-based VM context and begins interpreting encrypted bytecode — decrypting pages on demand, dispatching through handler tables, capturing EFLAGS into the context. *(executed under emulation through this point, §29)* The kernel then: resolves its own import set by **manually walking export tables** with a private rolling hash (152 APIs observed, incl. `IsWow64Process2`/`IsWow64Process` WOW64 probing and `IsUserAnAdmin`), initializes security descriptors (SID/ACL/DACL construction), queries the module path and current directory (backward `\`/`/` scan over the `GetModuleFileNameW` buffer), churns the heap, begins file/registry work, calls `VirtualProtect` 106 times (protection changes staging the original sections), and attempts to load `SETUPAPI.DLL`. *(inferred beyond the 320 M-instruction emulation frontier)* It decrypts the original program sections, rebuilds the real import table via runtime resolution, registers/loads bundled files (with `XBundlerTlsHelper` providing TLS support), performs licensing and environment checks using the fingerprinting imports, and finally transfers control to the original Delphi program's OEP.
+5. The protected application runs as a normal Win32 GUI process (common-controls v6, DPI-aware, `asInvoker`), with the SecureEngine kernel resident for continued protection; under (unknown) conditions the kernel can spawn the embedded restart helper to kill and relaunch a process.
+6. Process exit returns through the preserved loader stack path.
 
 ---
 
 ## 26. Overall Technical Architecture
 
-```
-┌──────────────────────────────────────────────────────────────────────────────┐
-│  Test2.exe  —  PE32 / i386 / GUI  —  32,868,040 bytes                        │
-│  Authenticode: Rafael Patricio Ahucha Ruiz (Oreans) — DIGEST VERIFIED        │
-├──────────────────────────────────────────────────────────────────────────────┤
-│                                                                              │
-│  ┌── DISTRIBUTION LAYER ────────────────────────────────────────────────┐    │
-│  │  PE headers · 20-DLL preload .idata · .edata (Themida.exe) ·          │    │
-│  │  .rsrc 48 KB (shield icon, version, manifest, 4 dialogs, RU strings) ·│    │
-│  │  .reloc 34 entries · TLS dir (no callbacks) ·                         │    │
-│  │  PKCS#7 signature 10,352 B (no overlay)                               │    │
-│  └───────────────────────────────────────────────────────────────────────┘    │
-│                                                                              │
-│  ┌── LAYER 1 · BOOTSTRAP (fully recovered, plain x86, ~600 bytes) ───────┐    │
-│  │  .text 0x04E7D000   entry stub: fake return, junk API storm,          │    │
-│  │                     opaque predicates, "WL  "/0xDEADBExx markers      │    │
-│  │  .data 0x04E7C000   "skeleton.dll" / "TestHello" / "kernel32.dll"     │    │
-│  │  .boot 0x038F9058   trampoline                                        │    │
-│  │        0x038F905D   aP_depack  (aPLib, 0x14B bytes)                   │    │
-│  │        0x038F91A8   BootMain   (self-locate, guard, 32x depack, jmp)  │    │
-│  │        0x038F9206   32 aPLib streams (21.5 MB)                        │    │
-│  └───────────────────────────────────────────────────────────────────────┘    │
-│                                   │ produces                                  │
-│                                   ▼                                           │
-│  ┌── LAYER 2 · SecureEngine RUNTIME (decompressed; code mutated) ────────┐    │
-│  │  .winlice RVA 0x018A7000, 28.3 MB, RWX, zero raw bytes                │    │
-│  │   ├ 0x000000–0x060000  loader + XBundlerTlsHelper.dll (+PDB path)     │    │
-│  │   ├ 0x12EBA60          terminate-and-relaunch stub (fully reversed)   │    │
-│  │   ├ 0x1300000–0x1400000 string pool: 16 switches, 5 reg keys,         │    │
-│  │   │                     13 value names, bug-check template            │    │
-│  │   └ 0x12FD4B4          ENGINE ENTRY -> mutated, flattened code        │    │
-│  │  .vm_sec  437 x {jmp rel32 site, +5} branch registry                  │    │
-│  │  Subsystems (evidenced by artefacts, algorithms not recovered):       │    │
-│  │    licence/trial · HWID (HWIn) · hook detect (HOOK_IN) ·              │    │
-│  │    thread protect (TP_IN) · integrity counters · bug-check reporter · │    │
-│  │    splash · XBundler DLL bundling · payload decryptor                 │    │
-│  └───────────────────────────────────────────────────────────────────────┘    │
-│                                   │ decrypts in place                         │
-│                                   ▼                                           │
-│  ┌── LAYER 3 · PAYLOAD  (ENCRYPTED — NOT RECOVERED) ─────────────────────┐    │
-│  │  Delphi XE2+ Win32 VCL application + madExcept                        │    │
-│  │  RVA 0x00001000 .. 0x0188F4E8  (24.6 MB virtual, 9.7 MB on disk)      │    │
-│  │  .text 16.0 MB · .itext 37 KB · .data 148 KB · .bss 40 KB ·           │    │
-│  │  .idata 23 KB · .didata 2.8 KB · .edata 179 B · .tls 1.6 KB ·         │    │
-│  │  .rdata 93 B · .reloc 1.5 MB · .rsrc 6.8 MB                           │    │
-│  │  Identity: Themida.exe 3.2.4.52 (Oreans) — strongly inferred          │    │
-│  │  Features / UI / logic: UNKNOWN                                       │    │
-│  └───────────────────────────────────────────────────────────────────────┘    │
-└──────────────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph Disk["On disk (32.87 MB)"]
+        direction TB
+        PE["PE headers + .idata(33 fns) + .rsrc + .edata"]
+        STUB[".text stub 1.5 KB"]
+        BOOT[".boot 22.58 MB (aPLib stream + depacker)"]
+        ENC["encrypted original program ~5.9 MB raw / 16.7 MB VA"]
+        VMSEC[".vm_sec pointer registry"]
+        CERT["Authenticode 0x2870"]
+    end
+    subgraph Mem["In memory at runtime"]
+        direction TB
+        W[".winlice RWX 29.7 MB = SecureEngine kernel\n(VM interpreter + handlers + encrypted VM program\n+ XBundlerTlsHelper.dll + restart-helper.exe)"]
+        ORIGD["decrypted original program (inferred)"]
+    end
+    STUB -->|"ret into"| BOOT
+    BOOT -->|"aPLib x32"| W
+    ENC -.->|"decrypted by kernel (inferred)"| ORIGD
+    VMSEC -.->|"patch/patch targets into"| W
+    W -->|"jmp OEP (inferred)"| ORIGD
 ```
 
-### Design summary
-
-The architecture is a **three-stage trust ladder** in which each stage is smaller and more exposed than the one it creates:
-
-* **Stage 1** is tiny (~600 bytes), fully visible, and therefore protected only by *obfuscation*: a faked return address, 92,928 pointless API calls, and unreachable code. Its single job is to reach `.boot`.
-* **Stage 2** is large and protected by *compression plus mutation*. The compression is standard aPLib — deliberately so, because it must be decoded by a few hundred bytes of bootstrap. The real protection is that its 28.3 MB of output is itself mutated and re-encrypted, so decompressing it (as done here) yields structure and strings but not readable algorithms.
-* **Stage 3** is protected by *encryption with a runtime-derived key*, making it unrecoverable without execution.
-
-The economics are deliberate: the cheap outer layer is sacrificed to slow tooling down, while the valuable payload is defended by a key that simply does not exist on disk. This analysis reached exactly the boundary that design intends — everything mechanical (packing, layout, loading) was fully reconstructed and verified; everything semantic (the application's behaviour) remains behind the runtime key.
+**Assessment:** `Test2.exe` is a *self-referential test artifact of the Oreans protection ecosystem*: a Delphi-built executable identifying itself as **Themida v3.2.4.52**, itself protected by the Oreans SecureEngine (WinLicense-family) packer — evidenced by the protector's own fingerprints at every layer (version resource, exports, `SecureEngine` PDB path, `WL` markers, `.winlice`/`.boot`/`.vm_sec` sections). The file was produced and signed on **2025-10-10** (link 09:24:29 UTC, signature 09:25:29 UTC) by an individual holding a Certum code-signing certificate. Stages 0–1 of the protection are fully reversed here, two internal helper PEs were extracted and reversed, and the VM architecture is documented — but the protected payload's logic (both protector-VM and original application) remains encrypted and would require dynamic analysis to recover.
 
 ---
 
-## Appendix A — Reproducing This Analysis
+## 27. Deeper Static Analysis — Round 2 (follow-up)
 
-```bash
-pip install pefile capstone
+A second static pass over the offline-unpacked 29,696,000-byte `.winlice` kernel image (SHA-256 `240247194afc4c29f88e9525ed1915c80ef8b9bdee33a1913958fe6b07d99b51`) and the packed file produced the findings below. All addresses are VA (`.winlice` base 0x1CA7000 = unpacked offset 0).
 
-# 1. Header / section / import / export / resource / version / Authenticode triage
-python3 tools/triage.py Test2.exe
+### 27.1 Cryptographic inventory of the kernel **[CONFIRMED negative; CONFIRMED constants]**
 
-# 2. Verify the signature chain and the embedded digest
-openssl pkcs7 -inform DER -in sig.der -print_certs -text | grep -E 'Subject:|Not (Before|After)'
-openssl asn1parse -inform DER -in sig.der -i | head -30     # SpcIndirectDataContent digest
-#   compare with the "computed SHA-256 PE digest" printed by triage.py
+* **Negative result:** the entire unpacked kernel contains **no** standard crypto constants — no AES S-box/inverse S-box/T-tables, no SHA-1/SHA-256/MD5/MD4/MD2 constants, no Blowfish P-array, no RC5/RC6, ChaCha (`expand 32-byte k`), Serpent, Twofish, Whirlpool tables, no base64 alphabet, and no CryptoAPI name strings (`CryptAcquireContext` etc.). The kernel's ciphers are therefore **custom (mutated) primitives, or generate their tables at runtime**.
+* **Positive result 1 — CRC32:** a complete, byte-exact **standard reflected CRC32 lookup table** (256 × 4 bytes) exists at unpacked+0x13B6CBC (VA **0x305DCBC**), inside the licensing/config code area — used for integrity checking. *(It was initially found at +0x13B6EBC, which is exactly `table[128]`; the table itself starts 512 bytes earlier.)*
+* **Positive result 2 — golden-ratio constant:** `0x9E3779B9` occurs at **8 sites**: +0x3CF9A (`mov edi,0x9E3779B9; mov ebp,edi; sub eax,ebp`), +0x12F4DC7 (`mov ebx,0x9E3779B9; …; sub eax,ecx`), +0x132669E, +0x1338C6B, +0x1394EA5, +0x13BA15D (`imul eax,esi,0x9E3779B9`), +0x141E8DD (`mov esi,0x9E3779B9`), +0x1472D39 (`imul eax,[ebp+0x10],0x9E3779B9`). Usage splits into **hash-mixing** (`imul reg,reg,0x9E3779B9` — golden-ratio multiplication) and **add/sub delta** usage (TEA/XTEA style). Several sites sit inside the VM-handler region and operate on the EBP VM context. **Conclusion:** the kernel uses custom Feistel/TEA-family-style mixing; the exact cipher was not reconstructed. **[CONFIRMED constant usage; cipher identity INFERRED]**
 
-# 3. Decompress .boot -> the .winlice runtime image (29,696,000 bytes)
-gcc -O2 -o aplib_unpack tools/aplib_unpack.c
-./aplib_unpack Test2.exe 0x9d2800 0x206 0x1C52000 winlice.bin
-#   arguments: <file> <.boot raw offset> <stream-table offset> <output size> <out>
-#   expected: "stream count = 32" and "total decompressed = 0x1c52000"
+### 27.2 WinLicense licensing subsystem **[CONFIRMED strings; logic INFERRED]**
 
-# 4. Mine the recovered image
-strings -a -n 6 winlice.bin | less
-strings -a -el -n 6 winlice.bin | less        # UTF-16: Themida64_GUI, extendkey.dat, ...
+The unpacked kernel contains an intact set of WinLicense licensing strings:
 
-# 5. Carve the embedded PEs (valid MZ/PE headers at these offsets)
-dd if=winlice.bin of=XBundlerTlsHelper.dll bs=1 skip=$((0x56F0))     count=8704
-dd if=winlice.bin of=relaunch_stub.exe     bs=1 skip=$((0x12EBA60))  count=3584
+| Kind | String | VA (unpacked+) |
+|---|---|---|
+| Registry key | `Software\WinLicense` | 0x1CAB28C (+0x428C) |
+| Registry key | `Software\WinLicense` | 0x2FC6478 (+0x131F478) |
+| Registry key | `SOFTWARE\WinLicense` | 0x305E1C4 (+0x13B71C4) |
+| Registry key | `Software\MyCompany\MyProduct` | 0x303DA3C (+0x1396A3C) |
+| Registry key | `Software\Company\Product` | 0x305DAB8 (+0x13B6AB8) |
+| Registry key | `Software\WLkt` | 0x3062E44 (+0x13BBE44) |
+| Value name | `WinLicenseVersion` | 0x1CA7618 (+0x618) |
+| Value name | `WinLicenseInstance` | 0x1CFDFDC (+0x56FDC) |
+| Value name | `WinLicenseDriverVersion` | 0x303E250 (+0x1397250) |
+| License file (UTF-16) | `TMLicenseA1.dat` | 0x303E010 (+0x1397010) |
+| License file (UTF-16) | `extendkey.dat` | 0x303D5EC (+0x13965EC) |
+| Misc | `license` | 0x3052838 (+0x13AB838) |
+
+`Software\MyCompany\MyProduct` and `Software\Company\Product` are the WinLicense SDK's **default placeholder** custom-registry keys — evidence that the protecting developer left the licensing options at their defaults. `TMLicenseA1.dat` is the classic WinLicense license-file name and `extendkey.dat` its extended-key file; `SHGetFolderPathW` (static import) would locate them. Machine fingerprinting fits `NetWkstaGetInfo`. **Note:** a dword-scan for absolute pointers to every one of these string VAs found **zero** references — all references are computed at runtime (position-independent code), so the consuming code sites could not be located statically.
+
+### 27.3 Kernel build identification and internal debug strings **[CONFIRMED]**
+
+* Build name **`Themida64_GUI`** (UTF-16) at +0x4CD40 (VA 0x1CF3D40) and +0x1339F94 (VA 0x2FE0F94) — the SecureEngine engine's internal build identity (a 64-bit-capable Themida GUI engine protecting this 32-bit target).
+* Build timestamp string **`Fri Oct 10 11:25:48 2025`** (UTF-16, +0x1EA4) — `asctime()` format, same day as the PE link stamp (09:24:29 UTC) and signing (09:25:29 UTC), consistent with the kernel blob being emitted during the protection run on 2025-10-10 (timezone unknown).
+* Leftover debug/log format strings: **`PROC_IN = %d, Process = %x`** (+0x16618), **`PROC_IN = %d`** (+0x2F7E4), **`TP_IN = %d`** (+0x33B3C), **`CHECK_OUT = %d`** (+0x46DA0) — process/thread-pool/checkpoint trace hooks in the kernel (output sink unknown; likely dormant unless a debug flag is set).
+
+### 27.4 Embedded command-line switches **[CONFIRMED strings; function INFERRED]**
+
+Seven isolated plaintext switch strings exist inside the kernel (embedded in code bytes, not in string tables):
+
+| Switch | VA |
+|---|---|
+| `/nosplash` | 0x1CAAD34 |
+| `/dis1` | 0x1CABFDC |
+| `/dumpstatus` | 0x1CDB588 |
+| `/skipactivexreg` | 0x1CF30F0 |
+| `/showcode2` | 0x1D0A31C |
+| `/dmtc` | 0x1D60297 |
+| `/checkprotection` | 0x303F5AC |
+
+These match the WinLicense engine's command-line handling for protected applications (splash suppression, status dump, ActiveX-registration skip, protection self-check). Their exact parsing and effect live in VM bytecode. The strings `/requestedPrivileges`, `/security`, `/trustInfo`, `/assembly` found nearby are **manifest XML tokens**, not switches.
+
+### 27.5 `.vm_sec` fully characterized **[CONFIRMED structure; purpose INFERRED]**
+
+Refines §8.6. Of the 0x61D0 meaningful bytes (file 0x9BDA00+):
+
+* The **(X, X+5) pairs form two contiguous runs** — entries 0–436 (437 pairs) and entries 1903–2150 (248 pairs), **685 pairs total**. Every X is an RVA into `.winlice`, and **all 685 were verified to point at an `E9` (`jmp rel32`) opcode** in the unpacked kernel — each pair registers **two consecutive 5-byte jump slots** in the kernel's threaded trampoline arrays (e.g. at VA 0x1CAF926/0x1CAF92B: `jmp 0x1CD80AE` / `jmp 0x1CBFEDA`).
+* Jump-target distribution: **243 → interpreter/bridge area** (unpacked+0–0x100000), **65 → +0x1200000–0x12FFFFF**, **377 → +0x1300000–0x13FFFFF** (VM-handler + licensing code). No jump target is itself a registered slot (no chains).
+* The remaining **1452 nonzero records** (entries 437–1902 and the tail) are a different record type: their first dword is a valid `.winlice` RVA in only ~1.5% of samples — possibly encrypted or differently encoded. **[UNKNOWN]**
+
+Interpretation: a registry of the kernel's 5-byte `jmp` bridges, used (inferred) to link or patch dispatch sites — consistent with Themida's redirected control flow and the mutated duplicate code blocks.
+
+### 27.6 `.data` runtime API table — exact parse **[CONFIRMED]**
+
+The hint/name table at 0x4E7C128 (each entry = 2-byte export hint + ASCII name + DLL):
+
+| # | API | Hint | DLL |
+|---|---|---|---|
+| 1 | `FreeLibrary` | 0x0A2 | KERNEL32 |
+| 2 | `GetCommandLineA` | 0x0B6 | KERNEL32 |
+| 3 | `GetCurrentThreadId` | 0x0E6 | KERNEL32 |
+| 4 | `GetModuleHandleA` | 0x111 | KERNEL32 |
+| 5 | `GetProcessHeap` | 0x12B | KERNEL32 |
+| 6 | `GetVersionExA` | 0x160 | KERNEL32 |
+| 7 | `HeapAlloc` | 0x180 | KERNEL32 |
+| 8 | `HeapFree` | 0x186 | KERNEL32 |
+| 9 | `LoadLibraryA` | 0x1A9 | KERNEL32 |
+| 10 | `VirtualAlloc` | 0x295 | KERNEL32 |
+| 11 | `VirtualFree` | 0x299 | KERNEL32 |
+| 12 | `MessageBoxA` | 0x05B | USER32 |
+| 13 | `ImmSetCompositionWindow` | 0x02B | IMM32 |
+| 14 | `ImageList_EndDrag` | 0x02B | COMCTL32 |
+
+Exactly 14 entries — matching the two duplicated 14-dword bookkeeping tables at 0x4E7C000/0x4E7C0E0 (values 0x2008–0x228F), whose indexing base is still **UNRESOLVED** (candidate: RVA-based indices into the encrypted original program's import area — untestable because section 0 is encrypted). `ImmSetCompositionWindow` and `ImageList_EndDrag` are known protector favorites as **anti-debug/decoy probes** (their behavior differs under debugged/instrumented sessions) — purpose **INFERRED**.
+
+The PE-visible `.idata` import set is now functionally classified: **licensing/environment-relevant** (`RegQueryValueExW`, `NetWkstaGetInfo`, `SHGetFolderPathW`, `VerQueryValueA`, `GetVersionExA`, `ImageDirectoryEntryToData`, `ShellExecuteExA`) vs. **one-per-DLL decoy fillers** (`WidenPath`, `CharNextW`, `InitializeFlatSB`, `sndPlaySoundW`, `OpenPrinterW`, `PrintDlgW`, `OleUIObjectPropertiesW`, `PathRelativePathToW`, `__WSAFDIsSet`, `CreateILockBytesOnHGlobal`, `SysFreeString`, `memset`) — 20 DLLs × 1–2 functions so the static import table superficially resembles a normal Delphi application while the real API surface is resolved at runtime.
+
+### 27.7 Second VM interpreter level at the kernel entry (0x2FA44B4) **[CONFIRMED mechanics]**
+
+Disassembling the kernel entry shows it is itself a **fetch-decode-dispatch loop with per-opcode decryption** — a second, mutated interpreter instance besides the one at unpacked+0 (§8.3):
+
+```asm
+0x2FA44CD:  mov edi, ebp
+0x2FA44CF:  add edi, 0x6c          ; ctx+0x6C = bytecode IP
+0x2FA44D5:  mov edi, [edi]
+0x2FA44ED:  movzx ecx, word [edi]  ; fetch 16-bit opcode
+0x2FA44FF:  xor ecx, [ebp+0xc8]    ; decrypt opcode with rolling key (ctx+0xC8)
+0x2FA456A:  xor word [ebp+0xd8], cx; update rolling state (ctx+0xD8)
+...
+0x2FA461D:  sub bx, 0xf442         ; handler index = state − 0xF442
+0x2FA463F:  add ebx, ebp           ; ctx-relative handler table
+0x2FA4658:  mov ebx, [ebx]         ; load handler address
 ```
 
-Generated artefacts (`sig.der`, `winlice.bin`, `embed_*.bin`) are excluded via `.gitignore` because they are large and fully reproducible from the two committed tools.
+The fetch/decode sequence (ctx+0x6C IP, ctx+0xC8 key, ctx+0xD8 state) is duplicated with mutations elsewhere (e.g. unpacked+0x2000–0x2300) — confirming **code mutation of the interpreter**. Static devirtualization would require reimplementing the rolling-key schedule per interpreter instance; not attempted.
+
+### 27.8 Timing / environment-check instruction census **[CONFIRMED counts; intent INFERRED]**
+
+Counts validated at instruction boundaries (a hit only counts if it decodes as the real instruction inside plausible code — raw byte matches in the 29.7 MB mutated/junk-padded image are meaningless by themselves):
+
+| Instruction | Validated count | Note |
+|---|---|---|
+| `rdtsc` | **76** | e.g. VA 0x1CB9F1F: `rdtsc` immediately followed by VM-context (ctx+0x6C) access — timing checks inside VM handler code |
+| `cpuid` | **78** | CPU/environment probing |
+| `int 2d` | **63** | classic anti-debug interrupt (no-op without debugger, raises otherwise) |
+| `sidt [mem]` / `sgdt [mem]` | 8 total | GDT/IDT base probing (VM/hypervisor detection) |
+
+No anti-debugger API *name* strings (`IsDebuggerPresent`, `NtQueryInformationProcess`, …) exist anywhere in the kernel — those APIs, if used, are resolved via the `.data`/`.idata` tables or runtime hash lookup (not statically enumerable).
+
+### 27.9 Overlay question closed **[CONFIRMED]**
+
+The only bytes past the last section's raw end (0x1F55E54) are the Authenticode certificate (file 0x1F55E58–0x1F586C8, 0x2870 bytes) plus a 4-byte gap. **No hidden overlay or appended payload exists.**
+
+### 27.10 Unknowns after round 2
+
+Round 2 resolved: overlay existence (none), `.vm_sec` record semantics (jmp-bridge registry, 2 runs), the kernel's crypto inventory (no standard primitives; CRC32 + golden-ratio/TEA-style mixing), the licensing subsystem's key/file names, the engine's build identity (`Themida64_GUI`), seven embedded command-line switches, and the exact 14-entry runtime API list. Still unknown: (a) the 1452 non-`+5` `.vm_sec` records, (b) the `.data` small-dword tables' indexing base, (c) the delay-import configuration blob (RVA 0x103C000), (d) VM bytecode semantics/OEP, (e) the original program's code, (f) all runtime behavior (no execution).
 
 ---
 
-## Appendix B — Complete Recovered String Inventory
+## 28. VM Handler Taxonomy and Cipher Structure — Round 3
 
-All offsets are within the decompressed `.winlice` image (`winlice.bin`), i.e. add `0x018A7000` for the RVA and `0x01CA7000` for the VA.
+A third pass classified **all 685 unique handler entry points** reachable through the `.vm_sec` jump-bridge registry (§27.5). Method: symbolic disassembly of each handler (capstone, ≤400 bytes or until the first unconditional transfer), tracking registers holding `ebp+const` to normalize every memory access to a VM-context offset, plus a per-handler feature census. The 685 bridge slots point at **685 distinct handlers — no duplicates**.
 
-### B.1 Command-line switches
+### 28.1 Refined VM-context field map (read/write census across 685 handlers) **[CONFIRMED counts; semantics INFERRED]**
 
-```
-0x00003D34  /nosplash          0x00004FDC  /dis1
-0x00034588  /dumpstatus        0x0004C0F0  /skipactivexreg
-0x0006331C  /showcode2         0x0131C8F4  /getwlstatus
-0x0132B98C  /logstatus         0x0132B99C  /bugcheck2
-0x0133637C  /bugcheckfull      0x01336390  /showinstance
-0x0133CCF4  /clrt              0x0134EC80  /bugcheck
-0x013985AC  /checkprotection   0x013A3428  /showcode
-0x013A7DC4  /deactivate        0x013D7544  /forcerun
-```
+| ctx offset | read by | written by | Interpretation |
+|---|---|---|---|
+| +0x6C | **425** | 15 | primary fetch/stream pointer in the 0x2FA44B4 interpreter (§27.7); byte lanes +0x6E/+0x6F also read |
+| +0xC8 | 410 | **395** | opcode-decrypt key (rolling — updated by nearly every handler) |
+| +0xD4 | 397 | **388** | rolling state #2 |
+| +0xD8 | 343 | **344** | rolling state #3 |
+| +0xB4 | 374 | 25 | read-mostly selector/flag |
+| +0x98 | 315 | 65 | read-mostly field |
+| +0x78 | 289 | 70 | pointer/tag (byte lanes +0x70–+0x7B read individually) |
+| +0x2C–0x40 | 128–276 | 124–129 | VM state words; **+0x38 read by 127 handlers, never written** → dispatch-table pointer (matches §10.3) |
+| +0x20 | 274 | 220 | work register |
+| +0x84 | 248 | 127 | second stream/counter (IP of the +0-level interpreter, §10.3; byte lanes +0x86–+0x8F) |
+| +0x04 | 231 | 227 | work register (symmetric r/w) |
+| +0x1C | 229 | 228 | work register (symmetric r/w) |
+| +0x14 | 171 | 172 | work register (symmetric r/w) |
+| +0x54, +0xB0 | 136–165 | 77–127 | auxiliary state |
 
-### B.2 Registry paths and value names
+The two byte-granular clusters **+0x6C–0x7B and +0x84–0x8F** (individual byte offsets read by 29–135 handlers each) show handlers accessing single bytes of the stream words — byte-wise operand decoding. The two interpreter levels (unpack+0 and 0x2FA44B4) evidently share one context layout with level-dependent field roles (+0x84 is the fetch pointer for one, +0x6C for the other).
 
-```
-0x0000428C  Software\WinLicense          0x0131F478  Software\WinLicense
-0x013B71C4  SOFTWARE\WinLicense          0x013BBE44  Software\WLkt
-0x01396A3C  Software\MyCompany\MyProduct 0x013B6AB8  Software\Company\Product
-0x00000618  WinLicenseVersion            0x01397250  WinLicenseDriverVersion
-0x00056FDC  WinLicenseInstance           0x000164C4  WLProjectName
-0x00046DB4  WLSoftwareName               0x0138D0B8  WLSoftwareVersion
-0x013899E8  WLProtectionDateTime         0x013284E0  Activation3417377625
-0x013E5258  trial_ext                    0x013AB838  license
-```
+### 28.2 Handler archetypes **[CONFIRMED tags; class names INFERRED]**
 
-### B.3 Files (UTF-16LE)
+| Archetype (tag combination) | Count |
+|---|---|
+| key-evolve + ip-read + vreg-io | **276** |
+| vreg-io + table-ref (ctx+0x38) + shift | 87 |
+| vreg-io + eflags | 70 |
+| key-evolve + ip-read + vreg-io + eflags | 47 |
+| vreg-io + table-ref + eflags + shift | 32 |
+| vreg-io + eflags + shift | 26 |
+| key-evolve + ip-read + vreg-read | 24 |
+| key-evolve + ip-read + vreg-io + shift | 16 |
+| key-evolve + ip-read + vreg-read + eflags | 15 |
+| plain (no ctx access) | 15 |
+| remaining combinations (≤11 each) | 83 |
 
-```
-0x01397010  TMLicenseA1.dat
-0x013965EC  extendkey.dat
-```
+Feature census: **210/685 handlers touch EFLAGS** (`pushfd`/`popfd` — the VM integrates real CPU flags, confirming round 1 at handler level), **202 use shifts**, 6 `imul`, 12 access no context at all (obfuscation/service blocks, e.g. VA 0x2FCF8B9). Handler bodies are large — median **97 instructions** to first unconditional transfer — consistent with heavy mutation.
 
-### B.4 Build / identity strings
+### 28.3 Notable individual handlers **[CONFIRMED code; semantics INFERRED]**
 
-```
-0x00001EA4  (UTF-16) Fri Oct 10 11:25:48 2025
-0x0004CD40  (UTF-16) Themida64_GUI
-0x01339F94  (UTF-16) Themida64_GUI
-0x00005DA0  Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\
-            embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb
-0x0136C206  ?2ndwsdk
-(outer .data 0x04E7C282) skeleton.dll      (outer .data 0x04E7C28F) TestHello
-```
+* **Timing instruction — VA 0x1CB9F1F** (48 insns): contains a genuine `rdtsc` and reads ctx+0x20, +0x6C (IP), +0xB4, +0xC8 (key). The VM instruction set itself includes a **timestamp-read instruction** — a VM-level anti-debug/timing primitive (the §27.8 census's `rdtsc`-adjacent-context example is this handler).
+* **Native-call instructions — 4 handlers**: 0x1CCCEF7, 0x1CF5C3A, 0x2FC0B5F each end in `push 0; push 0xC; call 0x1CE2763`, and 0x2F966E8 ends in `push 0; push 0xE0; call 0x2F8F5A6`. The call targets are jmp-bridge chains — i.e., the VM can invoke **shared kernel helper subroutines** with two immediate arguments (0 and a size/type code 0xC or 0xE0).
 
-### B.5 Counters, markers and diagnostics
+### 28.4 Cipher structure: ARX, no S-boxes **[CONFIRMED]**
 
-```
-0x000031DC  ExitOk           0x00010FE8  CheckIN          0x00018EC8  ExitOUT
-0x0012FC938 ProcOUT          0x0130F7C0  ProcIN           0x0130F7D0  ExitIN
-0x01301AB8  ExpInfo          0x01338C50  XprotExit        0x013605E0  TpIN
-0x013605EC  HWIN             0x013A32DC  CheckOUT         0x013A2FC8  SplashClassName
-0x013B49B0  Exception Information
+A full-image scan of all 29,696,000 unpacked bytes for **256-byte permutation windows (custom S-boxes) found zero**. Combined with §27.1 (no AES/SHA/MD5/… constants; golden-ratio multiplies; `add`/`xor`/`sub` everywhere; shifts in 202 handlers), the kernel's cipher and opcode obfuscation are **ARX-style (modular add, XOR, shift, multiply) — mutation-based, not substitution-based**.
 
-0x00016618  PROC_IN = %d, Process = %x     0x0002F7E4  PROC_IN = %d
-0x00033B3C  TP_IN = %d                     0x00046DA0  CHECK_OUT = %d
-0x0130821C  HOOK_IN = %d                   0x01331624  PROC_OUT = %d
-0x01331638  CHECK_IN = %d                  0x0135351C  PROC_OUT = %d, Process = %x
+### 28.5 Leftover `.vm_sec` records are encrypted **[CONFIRMED statistics]**
 
-0x013D968C  Please, contact the software developers with the following codes.
-            Thank you. (version %d.%d.%d)
-0x013D96ED         (press CTRL+C on this window to copy to clipboard)
-0x013D972C  CheckIN  = %d      0x013D973A  CheckOUT = %d
-0x013D9748  ProcIN   = %d      0x013D9756  ProcOUT  = %d
-0x013D9764  ExitIN   = %d      0x013D9772  ExitOUT  = %d
-0x013D9780  TPin     = %d      0x013D978E  HWIn     = %d
-0x013D979C  IntV     = %x, %x, %x, %x
-```
+The 1,452 non-`+5` records (entries 451–1902, §27.5) have a flat high-byte histogram with no XOR/byte-swap/add-bias transform mapping them into the `.winlice` range — statistically random, i.e. an encrypted blob, not pointers.
 
-### B.6 Imported API names inside the embedded relaunch stub
+### 28.6 Delay-import blob: no static shortcut **[CONFIRMED statistics]**
 
-```
-0x012EC2CA  CreateProcessA   0x012EC2DC  ExitProcess      0x012EC2EA  GetCommandLineA
-0x012EC2FC  GetStartupInfoA  0x012EC30E  OpenProcess      0x012EC324  TerminateProcess
-```
+The 36×32-byte records at RVA 0x103C000: per-record entropy 4.25–5.00 bits/byte (≈ maximum for 32-byte samples), every byte position holds 31–36 distinct values across records (no fixed fields), no repeated dwords, and XOR with the known magic constants (0x9E3779B9, 0xEDB88320, 0x54EC56B9, 0xAB4130, 0xBEEFAD01) yields no printable text. Record 31 uniquely ends in 8 zero bytes. The blob is properly encrypted; recovering it requires runtime keys.
+
+### 28.7 Synthesis
+
+The `.vm_sec` bridge registry indexes a **685-handler virtualization engine**: a shared VM-context layout with two fetch pointers (one per interpreter level), per-opcode rolling-key decryption (three evolving state fields), real-CPU-flag integration, a large mutated work-register set, byte-granular operand decoding, a dedicated timing instruction, and native-call instructions into kernel helpers. The cipher layer is ARX-based with no S-boxes or standard constants. Handler code is recoverable and now classified — but the **bytecode itself is stream-encrypted with the rolling keys**, so program semantics remain gated on runtime key material (see §24).
 
 ---
 
-## References
+## 29. Dynamic Emulation — Round 4 (Unicorn CPU emulation)
 
-1. Website Informer — oreans.com registrant record: *Oreans Technologies (Rafael Ahucha), Jerez, Cádiz, Spain* — https://website.informer.com/Rafael+Ahucha+Oreans+Technologies.html
-2. Oreans Technologies — official Themida PAD listing (`Themida.exe`, SecureEngine / Ring0 / DebuggerGuard description) — https://www.oreans.com/ThemidaPad.xml
-3. Stack Overflow — *Tool for licensing and protect my Delphi Win32 apps* (community note that Themida is itself built with Delphi) — https://stackoverflow.com/questions/2290324/tool-for-licensing-and-protect-my-delphi-win32-apps
-4. Delphi-PRAXiS — *How to remove default DLL exports Delphi Rio* (documents `__dbk_fcall_wrapper`, `dbkFCallWrapperAddr`, `TMethodImplementationIntercept` as default RAD Studio exports) — https://en.delphipraxis.net/topic/330-how-to-remove-default-dll-exports-delphi-rio/
+Round 4 moved from static analysis to **full-system CPU emulation** of the unpacked kernel using Unicorn 2.1.4 (x86-32), executing the WinLicense kernel natively instruction-by-instruction inside a synthetic Windows environment. This round **reversed the kernel's manual export-resolution engine completely**, recovered the exact runtime API set it resolves (§24 item 3 — answered), and drove execution **320 million instructions** deep into the kernel's initialization. All artifacts are in `tools/emu/` in this repository.
+
+### 29.1 Emulation harness **[CONFIRMED — it runs]**
+
+* **Memory layout**: image at 0x400000 (headers + raw sections); the reconstructed 29,696,000-byte `.winlice` image at `0x400000+0x18A7000` (regenerated per Appendix B steps 1–3); null page (fake-TEB pointers + SEH sentinel); GDT area; 2 MB stack; 8 MB heap at 0x20000000; stub page at 0x7F000000.
+* **Fake Windows environment**: fake TEB/PEB, and synthetic PE modules with full export directories — kernel32 @ 0x77E00000, user32 @ 0x77D40000, advapi32 @ 0x77DD0000, ntdll @ 0x77C00000, shell32 @ 0x7C9C0000, shlwapi @ 0x77F60000, plus minor modules. Each fake module is built with a **dynamically computed export layout** (functions/ordinals/names/thunks arrays sized from the name count N), a slot-0 "arena" name (`LoadLibraryA`, first byte rewritten to the sought first character by a hook, as bait), and 16-byte thunks (`push imm32; ret`) that vector into a Unicorn stub page where Python shims implement each API.
+* **Export name lists** (`tools/emu/names/`): complete Windows 7 export lists for kernel32 (1,352 names), advapi32 (805), user32 (822) — cross-checked against hand-written WinLicense-era lists — **plus a lowercase duplicate of every name** (the resolver is case-sensitive and seeks both cases; user32 genuinely exports lowercase `wsprintfA/W`, `wvsprintfA/W`).
+* **API shims**: ~50 functions with real semantics. Rule learned the hard way: **every buffer-writing API must actually write its buffer** — e.g. `GetModuleFileNameW` writes `C:\Test2.exe` (UTF-16LE), `GetCurrentDirectoryW` writes `C:\`, or the kernel's subsequent string scans loop forever on zero pages (the auto page-mapper feeds fresh zero pages on every guard fault).
+* **Chunked run loop**: `emu_start(count=20M)` in a resume loop — `emu_start` returns *normally* on count exhaustion, so completion is only declared when `EIP==0xDEAD0001` (the emulated OEP sentinel) and otherwise emulation resumes from the current EIP. Budget: 840 s / 2 B instructions.
+* Throughput ≈ 0.8–1.2 M instructions/s with all diagnostic hooks active.
+
+### 29.2 The kernel's manual export resolver — fully reversed **[CONFIRMED]**
+
+The WinLicense kernel does **not** use `GetProcAddress` for its own imports. It walks each module's export-name array itself, in plain sight of the emulator:
+
+1. **Name fetch**: `lodsd` from the module's names array → `edi` = name pointer.
+2. **First-char prefilter**: `cmp al, [edi]` @ **VA 0x1CA817A** — the sought name's first character (in `al`) is compared against each export name's first byte; non-matching names are skipped without hashing.
+3. **Length**: `scasb` NUL-scan loop @ **VA 0x1CAAC8D**.
+4. **Rolling hash loop** @ **VA 0x307E4D5** (per name byte, **including the terminating NUL** — the loop counter is `len+1`):
+   * `al = byte ^ cl` (inject the name byte into the low byte of the 16-bit state `ax`),
+   * rotate chain `cl ← ch; ch ← dl; dl ← dh; dh = 8` (loop counter),
+   * eight rounds of `shr bx,1; rcr ax,1; if carry-out: xor ax, 0x5041` — a CRC-16-style right-shift register with polynomial **0x5041** (the `bp` constant is computed inline as `~0x742D + 0xC46F` through obfuscated dead arithmetic),
+   * accumulate: `ecx ^= eax; edx ^= ebx`.
+   * State initialization: `eax = ebx = 0`, `ecx = edx = 0xFFFFFFFF`; the live state lives in the low 16 bits of `ecx`/`edx` (upper bits stay 0xFFFF). All of this is buried in an obfuscated jump-chain (≈45 machine instructions per name byte, with junk `je/js/jge` branches on constant state).
+5. **Finalization**: an obfuscated `xchg`/`xor`/`not` swap chain derives two 32-bit values: the **computed name hash in EAX** and the **walk target hash in EDX** (the target is constant for one walk; it enters through the obfuscated constant pushes in the finalization block).
+6. **Compare**: `cmp edx, eax` @ **VA 0x2F8FC65** → `je 0x1D040A0` = match → the walker then follows ordinals → function-address array → thunk.
+
+The dispatch into the resolved function was also located: the VM's function table hangs off VM-context `ebp+0x38` (matching the §10.3/§28.1 dispatch-table field), with the entry index computed as `(bytecode_operand − ctx_state) ^ 0x623DAD39`, masked to 16 bits, scaled by 4.
+
+### 29.3 Offline hash oracle **[CONFIRMED — validated 124/124]**
+
+Because the hash is deterministic (constant init state; name-only input), a **scratch Unicorn instance runs the kernel's real hash code** (entry 0x307E4D5, stop at the compare 0x2F8FC65) as a black-box oracle: `wl_hash(name) → uint32` (`tools/emu/wloracle.py`). Validation against 124 runtime-captured `(name, hash)` pairs: **124/124 exact**. Two reproducibility traps worth recording:
+
+* the byte counter is `len(name)+1` (the NUL is hashed);
+* this Unicorn build requires a code hook at the loop head that reads all six GPRs — without the forced register read, a lazy CPU-state-sync quirk silently produces wrong hashes (the hash path contains `fld`, and FPU-state desync changes junk-branch outcomes).
+
+With the oracle, **failed walks become solvable**: a failed walk exposes its target hash (EDX at the compare site), and the missing name can be brute-forced offline against a dictionary of API names and case variants.
+
+### 29.4 The kernel's runtime API set — recovered **[CONFIRMED — answers §24 item 3]**
+
+185 resolution walks were observed in the deepest run; **177 resolved, 152 unique API names** (full ordered log: `tools/emu/logs/emu_hashrows.txt`):
+
+> LoadLibraryA/W/ExA/ExW, VirtualAlloc/Protect/Free/Query, GetProcAddress, GetModuleHandleA/W/ExA/ExW, GetModuleFileNameA/W, SetEvent, SetEnvironmentVariableA/W, WaitForSingleObject, CreateEventA, CreateProcessW, GetStartupInfoW, GetThreadContext, GetCurrentThread/ThreadId/Process/ProcessId, TlsAlloc/SetValue, FreeLibrary, GetEnvironmentVariableA/W, GetTempPathW, GetTempFileNameW, wsprintfA/W, GetUserDefaultUILanguage, GetVersion, GetFileSize/Ex, CreateFileA/W, CreateFileMappingA/W, OpenFileMappingA/W, MapViewOfFile/Ex, UnmapViewOfFile, ExitProcess, RegOpenKeyA/W, RegCreateKeyA/ExA/ExW, RegQueryValueExA/W, RegQueryInfoKeyA, RegEnumKeyExA, RegSetValueExA/W, RegDeleteValueA/W, RegCloseKey, RegFlushKey, CloseHandle, Sleep, RtlEnter/Leave/InitializeCriticalSection, RtlAllocate/ReAllocate/FreeHeap, GetProcessHeap, CreateThread, NtQueryObject (ntdll), CreateDirectoryW, OutputDebugStringA, IsBadReadPtr, IsBadWritePtr, Get/SetFileTime, GetShort/LongPathNameW, GetWindows/SystemDirectoryW, MessageBoxExA/W, CreateToolhelp32Snapshot, Process32First/Next, Thread32First/Next, GetCommandLineA/W, TerminateThread, SuspendThread, WideCharToMultiByte, MultiByteToWideChar, CharLowerW (user32), OpenThread, Set/GetCurrentDirectoryW, GetFullPathNameW, GetFileAttributesA/W/ExA/ExW, SetFilePointer/Ex, ReadFile, WriteFile, SHGetSpecialFolderPathW (shell32), PathCanonicalizeW (shlwapi), StrToIntA (shlwapi), CopyFileA/W/ExA/ExW, LockFile/Ex, GetPrivateProfileStringW/IntW/SectionW, DeleteFileW, lstrcpynA, lstrcmpiA, GetLocalTime, GetSystemTime, SystemTimeToFileTime, FileTimeToSystemTime, IsWow64Process, **IsWow64Process2**, DeviceIoControl, GetMessageA, TranslateMessage, DispatchMessageA, AllocateAndInitializeSid, SetEntriesInAclA, LocalAlloc, InitializeSecurityDescriptor, SetSecurityDescriptorDacl, DuplicateHandle, GetFileInformationByHandle, OpenFile, LoadImageA/W, SearchPathA/W, OpenThreadToken, OpenProcessToken
+
+This confirms and greatly extends the §27.6 static 14-name list, and confirms the licensing/security cluster (SID/ACL construction, token queries), the registry cluster (14 registry APIs), the process-enumeration cluster (Toolhelp32 — process/thread scanning), the file-mapping cluster, and GUI message-pump APIs (GetMessage/Translate/Dispatch — the license dialog).
+
+**`IsWow64Process2` was recovered by oracle brute-force** (target hash `0xF5198738`, absent from every stock Windows 7 export list): the kernel probes the Windows 10 API first, then falls back to `IsWow64Process`. This corroborates §27.3 — the engine is a current-generation build (`Themida64_GUI`, kernel built 2025-10-10) that runs on modern Windows while still supporting XP-era hosts.
+
+`IsUserAnAdmin` (shell32) was also resolved and called — the kernel checks administrator privileges during initialization.
+
+### 29.5 Execution progress and the current frontier **[CONFIRMED]**
+
+Progressive milestones (each enabled by fixing the previous blocker):
+
+| Stage | Insns | Enabler |
+|---|---|---|
+| Kernel entry, IAT-based APIs | ~1 M | fake modules + PEB |
+| Manual resolution begins | ~40 M | correct export tables (name lists + case variants) |
+| Module/path handling | ~80 M | `GetModuleFileNameW`/`GetCurrentDirectoryW` write real buffers (backward `\`/`/` scan @0x1CC65A1 confirmed against the returned path buffer) |
+| Full first resolution batch | ~100 M | `IsWow64Process2` added; correct stdcall arg counts for all 152 APIs |
+| **Deep kernel work** | **320 M** | 106× `VirtualProtect`, heap churn, security/token checks, file I/O (`GetFileAttributesExW`, `CreateFileW`), `LoadLibraryA("SETUPAPI.DLL")` |
+
+At the 320 M frontier the kernel transferred control to **VA 0x40CA4AC — inside the original, still-encrypted `.text`** — and faulted reading unmapped data (`0x634C05DA`). Two facts frame the remaining gap:
+
+* **Dirty pages in encrypted sections 0–10: 0.** The 106 `VirtualProtect` calls re-flagged page permissions, but no decrypted content has been written into the original code sections yet — the transfer at 0x40CA4AC is therefore *premature*, not OEP.
+* The premature jump is consistent with the run's unimplemented environment: `LoadLibraryA("SETUPAPI.DLL")` returned 0 (no fake module), `MultiByteToWideChar`/`CreateFileW` returned failure defaults, and the kernel branched on those results. In other words: the frontier is now **shim fidelity**, not a protection dead-end.
+
+### 29.6 Remaining unresolved resolutions **[hashes CONFIRMED; names UNKNOWN]**
+
+Eight walks in the deepest run did not match any available name. Their target hashes (recoverable by the §29.3 oracle against a wider dictionary — likely SETUPAPI/XP-era or case-variant names):
+
+| Target hash | First char | Scope of sweep |
+|---|---|---|
+| `0x9EE9544E`, `0xD1132848`, `0xD4BB60CC`, `0x9E50F268` | `G` | full kernel32 sweep (2,723 names) |
+| `0xE9352F4F` | `S` | advapi32 (523 candidates) |
+| `0xDCCFD199` | `w` (lowercase) | ntdll (162 candidates) |
+| `0xC2A27581` | `w` (lowercase) | single candidate — a module with no `w` names (likely the missing SETUPAPI module) |
+| `0x9E0A1BA1` | `Z` | single candidate — same small module |
+
+### 29.7 Conclusions of round 4
+
+1. **The kernel's API-resolution engine is fully reversed** (mechanics, hash, dispatch) and **reproducible offline** — a complete, validated tool now exists for enumerating everything the kernel resolves (`tools/emu/`).
+2. **The runtime API set (152 names) is recovered** — §24 item 3 answered; §14–§17 import-based inferences are now backed by observed runtime behavior.
+3. **The protection's initialization is observable end-to-end** up to the decryption staging area (VirtualProtect storm, token/admin checks, file probing, SETUPAPI load).
+4. The original application's code remains encrypted at the current frontier (0 dirty pages); OEP has not been reached. The remaining work is enumerated and mechanical: SETUPAPI fake module, five more name brute-forces, and faithful `MultiByteToWideChar`/`CreateFileW`/token shims.
 
 ---
 
-*Report generated 2025-09-30 from static analysis of `Test2.exe` (SHA-256 `1fe62f8ea1879b34d5cc711a8999e878e3394896dbd761d8bd95b8d8c51f0e27`). Every address, offset, byte sequence and string quoted above was read directly from the binary or from the verified decompression of its `.boot` section. No symbol, function, API, address, or behaviour has been invented; items that could not be established are labelled unknown, inferred, or uncertain.*
+## Appendix A — Sibling artifact: `test.exe` (context, not the subject)
+
+The repository also contains `test.exe` (613,376 bytes, SHA-256 `b16e4004dbc2f0e96b708cd908d4b6336af15e2f504fb93a1c26188b9d8af581`). It is **not related to `Test2.exe` technically** — a byte-level search found no copy of it (or its sections) inside `Test2.exe`, and it is an x64 MSVC binary versus the 32-bit Delphi-based subject. Both files do carry Russian-language (0x419) resources, suggesting a common locale of the sample set.
+
+Key facts (static, confirmed):
+
+* PE32+ x86-64, console subsystem, MSVC linker 14.44, TimeDateStamp 2025-09-06, **PDB path `D:\source\test\x64\Release\test.pdb`**.
+* Strings: **`lmaobox crack by ggpabuk, thelifeworm, yahcherry`**, `tf_win64.exe`, `Game isn't started!`, `error 1!`, `fat tom`, `pizda`, `pause`.
+* Resources: custom-type resource named **`PIZDA`** (ID 102, lang 0x419, **593,920 bytes** at RVA 0x70B0 — an embedded payload DLL) plus a standard manifest.
+* Imports (kernel32 + CRT): `CreateToolhelp32Snapshot`, `Process32First/Next`, `OpenProcess`, `VirtualAllocEx`, `WriteProcessMemory`, `CreateRemoteThread`, `ReadProcessMemory`, `VirtualFreeEx`, `LoadLibraryA`, `GetProcAddress`, `FindResourceA`/`LoadResource`/`LockResource`/`SizeofResource`, `WaitForSingleObject`, `CloseHandle`, **`IsDebuggerPresent`**, `system` (used for `pause`).
+* Behavior (reconstructed from imports/strings): enumerate processes to find **`tf_win64.exe` (Team Fortress 2)**; if absent print `Game isn't started!` and pause; otherwise open the game process, copy the `PIZDA` resource payload into it (`VirtualAllocEx` + `WriteProcessMemory`), execute it with **`CreateRemoteThread`** (classic DLL/injection), wait, and pause the console. It is a **game-cheat loader**, unrelated to `Test2.exe`'s protection theme.
+
+## Appendix B — Reproduction notes and derived artifacts
+
+Recipe used for the offline unpacking (reproducible):
+
+1. Parse PE (pefile) → note EP RVA 0x4A7D000 (`.text`), `.boot` RVA 0x34F9000 (file 0x9D2800).
+2. Disassemble EP (capstone i386) → follow `ret 0xC` target 0x38F9058 → driver 0x38F91A8 → depacker 0x38F905D, stream at `.boot+0x206`, 32 blocks.
+3. Feed the 32 consecutive streams to a pure-Python aPLib depacker (`aplib` 0.6); each block yields exactly 928,000 bytes; concatenate → 29,696,000 bytes = the runtime `.winlice` image.
+4. Scan the result for validated `MZ…PE\0\0` images → carve the two embedded PEs at offsets +0x56F0 and +0x12EBA60.
+
+Round-2 techniques (§27), all reproducible with the same toolchain:
+
+5. **Crypto-constant scan** — byte-search the unpacked image for AES/SHA/MD5/Blowfish/RC5/RC6/ChaCha/base64/CRC constants (all negative except the CRC32 table at +0x13B6CBC and `0x9E3779B9` ×8).
+6. **`.vm_sec` parse** — read 8-byte records at file 0x9BDA00; keep records with `b==a+5`; map `a` to unpacked offset `a−0x18A7000`; verify byte at that offset is `0xE9` and decode the rel32 target.
+7. **Instruction census** — for each candidate byte pattern (`0F 31`, `0F A2`, `CD 2D`, …) require a capstone decode in which the pattern is an actual instruction at an instruction boundary and is surrounded by plausible code, to exclude junk/data matches.
+8. **String sweeps** — ASCII + UTF-16LE extraction over the unpacked image; `.data` hint/name table parsed at 0x4E7C128; overlay check by comparing last-section raw end (0x1F55E54) with the certificate directory extent (0x1F55E58+0x2870) and the file size (0x1F586C8).
+
+Round-3 techniques (§28):
+
+9. **Handler census** — for each of the 685 `.vm_sec` bridge targets: capstone disassembly (≤400 bytes / to first unconditional transfer) with a light symbolic tracker (registers holding `ebp+const` via `mov`/`lea`/`add`) normalizing memory operands to VM-context offsets; per-handler read/write sets and feature tags (rdtsc/call/eflags/shift/mul), then archetype clustering.
+10. **S-box scan** — full-image search for 256-byte permutation windows: for each byte value, mark window-starts that would contain two occurrences <256 apart; unmarked starts are permutations (0 found).
+11. **Blob statistics** — per-record entropy, per-position byte diversity across records, XOR probes with known magic constants, and transform tests (XOR/byte-swap/add-bias) for the leftover `.vm_sec` dwords.
+
+Round-4 techniques (§29) — all scripts and logs are stored in this repository under `tools/`:
+
+12. **Unicorn harness** (`tools/emu/emu1.py`, ~1,700 lines): image + reconstructed `.winlice` kernel mapping, fake TEB/PEB/GDT, synthetic PE modules with dynamically computed export directories (arena slot-0 bait + 16-byte `push imm32; ret` thunks into a 0x7F000000 stub page), ~50 Python API shims with real buffer semantics, stdcall arg-count table for all 152 resolved APIs (cdecl handling for `wsprintf*`), chunked run loop with EIP-verified resume. Run: `PYTHONPATH=<unicorn-2.1.4> python3 emu1.py` (expects the reconstructed kernel image at `/tmp/test2_winlice_unpacked.bin`, Appendix B steps 1–3, and the name lists in `tools/emu/names/`).
+13. **Walk instrumentation** — a hook at the first-char compare (0x1CA817A) captures the walk; hooks at the hash loop head (0x307E4D5) and the compare (0x2F8FC65) capture `(name, target hash, match)` for every hashed export name; a thunk hook logs every executed resolution thunk. Output: `tools/emu/logs/emu_hashrows.txt` (the definitive resolution log), `emu_thunkres.txt`, `emu_walks.txt`.
+14. **Offline hash oracle** (`tools/emu/wloracle.py`): a scratch Unicorn instance executing the kernel's real hash path (0x307E4D5 → 0x2F8FC65) with the documented init state; validated 124/124 against runtime pairs (`emu_oracle_data.json`). Used to brute-force failed walks (e.g. `IsWow64Process2` = target `0xF5198738`, found over a 15,918-name dictionary of API names and case variants).
+
+Derived artifact hashes (not stored in the repository due to size):
+
+| Artifact | SHA-256 |
+|---|---|
+| Reconstructed `.winlice` image (29,696,000 B) | `240247194afc4c29f88e9525ed1915c80ef8b9bdee33a1913958fe6b07d99b51` |
+| Embedded DLL `XBundlerTlsHelper` (8,704 B, unpacked offset +0x56F0) | `de0aa79373299d38e79f5895530c54d43970c18867212ee171580e5e28dca5eb` |
+| Embedded restart-helper EXE (3,584 B, unpacked offset +0x12EBA60) | `86ffd39f8c53924a25935a4e1667487c2a63c7c8313e4d4f6bb13a9ac742db3b` |
+| Authenticode message digest (embedded, verified) | `27ce79462c82d368da3cfa079e2bc38bf366c703f23cefb4dce2e0eb4b730797` |
+
+Repository artifacts added by round 4 (`tools/`):
+
+| Path | Contents |
+|---|---|
+| `tools/emu/emu1.py` | The complete emulation harness (§29.1) |
+| `tools/emu/wloracle.py` | The offline name-hash oracle (§29.3) |
+| `tools/emu/names/` | Windows 7 export name lists for kernel32 (1,352), advapi32 (805), user32 (822) — used to build the fake modules |
+| `tools/emu/logs/emu_hashrows.txt` | Definitive export-resolution log: every hashed name, walk target hash, and match verdict (185 walks → 177 resolutions → 152 unique APIs) |
+| `tools/emu/logs/emu_thunkres.txt` | Log of every executed resolution thunk (module, name, thunk VA) |
+| `tools/emu/logs/emu_oracle_data.json` | Runtime-captured (name → hash) validation pairs for the oracle |
+| `tools/emu/logs/emu_result.json` | Latest run result: status, API census, event log |
+| `tools/emu/logs/emu_walks.txt`, `emu_scan.txt`, `emu_mod_diag.json` | Walk summaries, path-separator-scan diagnostics, fake-module layout dump |
+| `tools/emu/logs/emu_ring_tail.txt.gz` | Compressed tail of the instruction ring from the deepest run (crash context) |
+| `tools/emu/probe.py`, `tools/emu/handlers.json` | VM-handler probe and round-3 handler classification data |
+| `tools/static/` | All 40 static-analysis scripts from rounds 1–3 (unpacker, `.vm_sec` parsers, crypto/S-box scans, handler taxonomy, string sweeps) |
+
+*End of report.*
+

@@ -1,0 +1,47 @@
+{
+ "kernel32.dll": {
+  "0x2840": "70 d5 00 00 80 d5 00 00 90 d5 00 00 a0 d5 00 00 b0 d5 00 00 c0 d5 00 00 d0 d5 00 00 e0 d5 00 00",
+  "0x2800": "70 d4 00 00 80 d4 00 00 90 d4 00 00 a0 d4 00 00 b0 d4 00 00 c0 d4 00 00 d0 d4 00 00 e0 d4 00 00",
+  "names1": "0x8c80",
+  "thunk0": "70 b4 00 00 80 b4 00 00",
+  "name_rva": "0x1f9aa"
+ },
+ "ntdll.dll": {
+  "0x2840": "65 70 74 69 6f 6e 48 61 6e 64 6c 65 72 00 52 74 6c 53 69 7a 65 48 65 61 70 00 52 74 6c 55 6e 69",
+  "0x2800": "6e 00 52 74 6c 4c 65 61 76 65 43 72 69 74 69 63 61 6c 53 65 63 74 69 6f 6e 00 52 74 6c 52 65 41",
+  "names1": "0x236f",
+  "thunk0": "68 a0 57 00 7f c3 00 00",
+  "name_rva": "0x2e99"
+ },
+ "user32.dll": {
+  "0x2840": "b8 02 b9 02 ba 02 bb 02 bc 02 bd 02 be 02 bf 02 c0 02 c1 02 c2 02 c3 02 c4 02 c5 02 c6 02 c7 02",
+  "0x2800": "98 02 99 02 9a 02 9b 02 9c 02 9d 02 9e 02 9f 02 a0 02 a1 02 a2 02 a3 02 a4 02 a5 02 a6 02 a7 02",
+  "names1": "0x4c20",
+  "thunk0": "10 74 00 00 20 74 00 00",
+  "name_rva": "0xc1da"
+ },
+ "advapi32.dll": {
+  "0x2840": "68 00 7e 00 7f c3 00 00 00 00 00 00 00 00 00 00 68 10 7e 00 7f c3 00 00 00 00 00 00 00 00 00 00",
+  "0x2800": "68 c0 7d 00 7f c3 00 00 00 00 00 00 00 00 00 00 68 d0 7d 00 7f c3 00 00 00 00 00 00 00 00 00 00",
+  "names1": "0x3690",
+  "thunk0": "10 50 00 00 20 50 00 00",
+  "name_rva": "0x6ff2"
+ },
+ "version.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "shfolder.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "shell32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "gdi32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "comctl32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "imm32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "winmm.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "winspool.drv": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "comdlg32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "oledlg.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "ole32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "oleaut32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "shlwapi.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "wsock32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "netapi32.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "msvcrt.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)",
+ "imagehlp.dll": "Invalid memory read (UC_ERR_READ_UNMAPPED)"
+}
