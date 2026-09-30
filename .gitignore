@@ -1,0 +1,6 @@
+# Generated reverse-engineering artifacts (reproducible via tools/)
+sig.der
+winlice.bin
+*.o
+aplib_unpack
+embed_*.bin
