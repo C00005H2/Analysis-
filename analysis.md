@@ -1480,5 +1480,94 @@ Repository artifacts added by round 4 (`tools/`):
 | `tools/emu/probe.py`, `tools/emu/handlers.json` | VM-handler probe and round-3 handler classification data |
 | `tools/static/` | All 40 static-analysis scripts from rounds 1–3 (unpacker, `.vm_sec` parsers, crypto/S-box scans, handler taxonomy, string sweeps) |
 
+## Appendix C — Complete Recovered String Inventory (parallel static pass)
+
+All offsets are within the decompressed `.winlice` image (`winlice.bin`), i.e. add `0x018A7000` for the RVA and `0x01CA7000` for the VA.
+
+### C.1 Command-line switches
+
+```
+0x00003D34  /nosplash          0x00004FDC  /dis1
+0x00034588  /dumpstatus        0x0004C0F0  /skipactivexreg
+0x0006331C  /showcode2         0x0131C8F4  /getwlstatus
+0x0132B98C  /logstatus         0x0132B99C  /bugcheck2
+0x0133637C  /bugcheckfull      0x01336390  /showinstance
+0x0133CCF4  /clrt              0x0134EC80  /bugcheck
+0x013985AC  /checkprotection   0x013A3428  /showcode
+0x013A7DC4  /deactivate        0x013D7544  /forcerun
+```
+
+### C.2 Registry paths and value names
+
+```
+0x0000428C  Software\WinLicense          0x0131F478  Software\WinLicense
+0x013B71C4  SOFTWARE\WinLicense          0x013BBE44  Software\WLkt
+0x01396A3C  Software\MyCompany\MyProduct 0x013B6AB8  Software\Company\Product
+0x00000618  WinLicenseVersion            0x01397250  WinLicenseDriverVersion
+0x00056FDC  WinLicenseInstance           0x000164C4  WLProjectName
+0x00046DB4  WLSoftwareName               0x0138D0B8  WLSoftwareVersion
+0x013899E8  WLProtectionDateTime         0x013284E0  Activation3417377625
+0x013E5258  trial_ext                    0x013AB838  license
+```
+
+### C.3 Files (UTF-16LE)
+
+```
+0x01397010  TMLicenseA1.dat
+0x013965EC  extendkey.dat
+```
+
+### C.4 Build / identity strings
+
+```
+0x00001EA4  (UTF-16) Fri Oct 10 11:25:48 2025
+0x0004CD40  (UTF-16) Themida64_GUI
+0x01339F94  (UTF-16) Themida64_GUI
+0x00005DA0  Z:\Development\SecureEngine\src\plugins_manager\internal_plugins\
+            embedded dlls\TlsHelperXBundler\Release\XBundlerTlsHelper.pdb
+0x0136C206  ?2ndwsdk
+(outer .data 0x04E7C282) skeleton.dll      (outer .data 0x04E7C28F) TestHello
+```
+
+### C.5 Counters, markers and diagnostics
+
+```
+0x000031DC  ExitOk           0x00010FE8  CheckIN          0x00018EC8  ExitOUT
+0x0012FC938 ProcOUT          0x0130F7C0  ProcIN           0x0130F7D0  ExitIN
+0x01301AB8  ExpInfo          0x01338C50  XprotExit        0x013605E0  TpIN
+0x013605EC  HWIN             0x013A32DC  CheckOUT         0x013A2FC8  SplashClassName
+0x013B49B0  Exception Information
+
+0x00016618  PROC_IN = %d, Process = %x     0x0002F7E4  PROC_IN = %d
+0x00033B3C  TP_IN = %d                     0x00046DA0  CHECK_OUT = %d
+0x0130821C  HOOK_IN = %d                   0x01331624  PROC_OUT = %d
+0x01331638  CHECK_IN = %d                  0x0135351C  PROC_OUT = %d, Process = %x
+
+0x013D968C  Please, contact the software developers with the following codes.
+            Thank you. (version %d.%d.%d)
+0x013D96ED         (press CTRL+C on this window to copy to clipboard)
+0x013D972C  CheckIN  = %d      0x013D973A  CheckOUT = %d
+0x013D9748  ProcIN   = %d      0x013D9756  ProcOUT  = %d
+0x013D9764  ExitIN   = %d      0x013D9772  ExitOUT  = %d
+0x013D9780  TPin     = %d      0x013D978E  HWIn     = %d
+0x013D979C  IntV     = %x, %x, %x, %x
+```
+
+### C.6 Imported API names inside the embedded relaunch stub
+
+```
+0x012EC2CA  CreateProcessA   0x012EC2DC  ExitProcess      0x012EC2EA  GetCommandLineA
+0x012EC2FC  GetStartupInfoA  0x012EC30E  OpenProcess      0x012EC324  TerminateProcess
+```
+
+---
+
+## Appendix D — References (from the parallel static pass)
+
+1. Website Informer — oreans.com registrant record: *Oreans Technologies (Rafael Ahucha), Jerez, Cádiz, Spain* — https://website.informer.com/Rafael+Ahucha+Oreans+Technologies.html
+2. Oreans Technologies — official Themida PAD listing (`Themida.exe`, SecureEngine / Ring0 / DebuggerGuard description) — https://www.oreans.com/ThemidaPad.xml
+3. Stack Overflow — *Tool for licensing and protect my Delphi Win32 apps* (community note that Themida is itself built with Delphi) — https://stackoverflow.com/questions/2290324/tool-for-licensing-and-protect-my-delphi-win32-apps
+4. Delphi-PRAXiS — *How to remove default DLL exports Delphi Rio* (documents `__dbk_fcall_wrapper`, `dbkFCallWrapperAddr`, `TMethodImplementationIntercept` as default RAD Studio exports) — https://en.delphipraxis.net/topic/330-how-to-remove-default-dll-exports-delphi-rio/
+
 *End of report.*
 
