@@ -2,9 +2,14 @@ name: Wine and Xvfb Runner
 
 on:
   push:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
+      - 'arena/**'
   pull_request:
-    branches: [ main, master ]
+    branches:
+      - main
+      - master
   workflow_dispatch:
 
 jobs:
