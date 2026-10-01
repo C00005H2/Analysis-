@@ -112,6 +112,17 @@ if [ "$SKIP_DEBS" -eq 0 ] && [ -d "$DIR/debs" ]; then
             ok "nothing to patch (host glibc is new enough)"
         fi
     fi
+
+    # -----------------------------------------------------------------------
+    # The bundle installs Ubuntu's libcurl, which needs libssh/libldap that are
+    # not shipped for amd64. Without them the loader refuses to start every
+    # libcurl consumer -- including git-over-HTTPS. Provide inert stand-ins.
+    say "Resolving unsatisfiable optional libraries"
+    if [ -n "${CC:-}" ] && [ -x "$DIR/tools/stub-missing-libs.sh" ]; then
+        bash "$DIR/tools/stub-missing-libs.sh" || warn "stub generation failed"
+    else
+        warn "skipped (needs a C compiler); git/curl over HTTPS may not start"
+    fi
 fi
 
 # ---------------------------------------------------------------------------

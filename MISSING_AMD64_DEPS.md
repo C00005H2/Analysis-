@@ -156,3 +156,31 @@ valid verification — `install.sh` probes each backend instead.
    to `debs/`; `install.sh` will then resolve the full dependency set.
 3. **Allow a one-off online install** (breaks the offline requirement):
    `.venv/bin/pip install gevent`
+
+## 5. libcurl's optional transports (handled automatically)
+
+The bundle installs Ubuntu's `libcurl3t64-gnutls` / `libcurl4t64`, whose
+`DT_NEEDED` list includes `libssh.so.4`, `libldap.so.2` and `liblber.so.2`.
+Those are **not shipped for amd64**, and the dynamic loader refuses to start
+*any* libcurl consumer when they are missing — which silently breaks
+`git` over HTTPS and `curl`:
+
+```
+git-remote-https: error while loading shared libraries: libssh.so.4
+```
+
+Note the Ubuntu `t64` package renames (`libcurl3-gnutls` →
+`libcurl3t64-gnutls`, `libasound2` → `libasound2t64`, ...) mean these do not
+look like replacements of host packages, so they are installed even in the
+default "don't replace host packages" mode.
+
+`install.sh` runs `tools/stub-missing-libs.sh`, which compiles inert
+stand-ins exporting exactly the symbols and symbol *versions* the consumer
+imports (e.g. `sftp_init@LIBSSH_4_5_0`). They are written to
+`/usr/local/lib/offline-bundle-stubs` and registered via `ld.so.conf.d`;
+nothing is overwritten.
+
+HTTPS, FTP and the rest of curl work normally. The `scp://`, `sftp://` and
+`ldap://` URL schemes do not. Shipping the real amd64 `libssh-4` and
+`libldap2` packages removes the need for the stubs — delete the directory and
+run `ldconfig` to drop them.
