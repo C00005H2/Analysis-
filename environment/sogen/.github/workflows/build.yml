@@ -1,0 +1,16 @@
+name: Build PR
+
+on:
+  pull_request:
+    branches:
+      - "**"
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  ci:
+    uses: ./.github/workflows/ci-reusable.yml
+    secrets: inherit

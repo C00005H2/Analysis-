@@ -1,0 +1,942 @@
+#include "../std_include.hpp"
+#include "../emulator_utils.hpp"
+#include "../io_completion_wait.hpp"
+#include "../syscall_utils.hpp"
+
+namespace sogen
+{
+
+    namespace syscalls
+    {
+        NTSTATUS handle_NtSetEvent(const syscall_context& c, uint64_t handle, emulator_object<LONG> previous_state);
+        NTSTATUS handle_NtReleaseMutant(const syscall_context& c, handle mutant_handle, emulator_object<LONG> previous_count);
+        NTSTATUS handle_NtReleaseSemaphore(const syscall_context& c, handle semaphore_handle, ULONG release_count,
+                                           emulator_object<LONG> previous_count);
+
+        NTSTATUS handle_NtClose(const syscall_context& c, const handle h)
+        {
+            const auto value = h.value;
+
+            if (h.h == 0xDEADC0DE || h.h == 0xDEADBEEF)
+            {
+                c.win_emu.callbacks.on_suspicious_activity("Anti-debug check with invalid handle");
+
+                return STATUS_INVALID_HANDLE;
+            }
+
+            if (value.is_pseudo)
+            {
+                return STATUS_SUCCESS;
+            }
+
+            if (value.type == handle_types::wait_completion_packet)
+            {
+                auto* wait_packet = c.proc.wait_completion_packets.get(h);
+                if (wait_packet && wait_packet->ref_count == 1)
+                {
+                    io_completion_wait::cleanup_wait_packet_on_close(c.proc, h);
+                }
+            }
+
+            if (value.type == handle_types::worker_factory)
+            {
+                auto* factory = c.proc.worker_factories.get(h);
+                if (factory && factory->ref_count == 1)
+                {
+                    io_completion_wait::release_handle_reference(c.proc, factory->io_completion_handle);
+                }
+            }
+
+            if (value.type == handle_types::file)
+            {
+                auto* file = c.proc.files.get(h);
+                if (file && file->ref_count == 1)
+                {
+                    for (auto it = c.proc.file_locks.begin(); it != c.proc.file_locks.end();)
+                    {
+                        auto& locks = it->second.locks;
+                        std::erase_if(locks, [&](const file_lock_range& lock) { return lock.owner == h; });
+
+                        if (locks.empty())
+                        {
+                            it = c.proc.file_locks.erase(it);
+                            continue;
+                        }
+
+                        ++it;
+                    }
+                }
+            }
+
+            uint64_t section_backing_address = 0;
+            if (value.type == handle_types::section)
+            {
+                auto* section = c.proc.sections.get(h);
+                if (section && section->ref_count == 1)
+                {
+                    section_backing_address = section->backing_address;
+                }
+            }
+
+            auto* handle_store = c.proc.get_handle_store(h);
+            if (handle_store && handle_store->erase(h))
+            {
+                if (section_backing_address != 0)
+                {
+                    c.win_emu.memory.release_memory(section_backing_address, 0);
+                }
+                return STATUS_SUCCESS;
+            }
+
+            return STATUS_INVALID_HANDLE;
+        }
+
+        NTSTATUS handle_NtDuplicateObject(const syscall_context& c, const handle source_process_handle, const handle source_handle,
+                                          const handle target_process_handle, const emulator_object<handle> target_handle,
+                                          const ACCESS_MASK /*desired_access*/, const ULONG /*handle_attributes*/, const ULONG /*options*/)
+        {
+            if (!c.proc.is_current_process_handle(source_process_handle) || !c.proc.is_current_process_handle(target_process_handle))
+            {
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            const auto resolved_source_handle = c.proc.resolve_object_pseudo_handle(source_handle, c.vcpu.active_thread);
+
+            if (resolved_source_handle.value.is_pseudo)
+            {
+                target_handle.write(resolved_source_handle);
+                return STATUS_SUCCESS;
+            }
+
+            auto* store = c.proc.get_handle_store(resolved_source_handle);
+            if (!store)
+            {
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            const auto new_handle = store->duplicate(resolved_source_handle);
+            if (!new_handle)
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            target_handle.write(*new_handle);
+            return STATUS_SUCCESS;
+        }
+
+        std::u16string get_type_name(const handle_types::type type)
+        {
+            switch (type)
+            {
+            case handle_types::file:
+                return u"File";
+            case handle_types::device:
+                return u"Device";
+            case handle_types::event:
+                return u"Event";
+            case handle_types::section:
+                return u"Section";
+            case handle_types::symlink:
+                return u"Symlink";
+            case handle_types::directory:
+                return u"Directory";
+            case handle_types::semaphore:
+                return u"Semaphore";
+            case handle_types::port:
+                return u"Port";
+            case handle_types::thread:
+                return u"Thread";
+            case handle_types::registry:
+                return u"Registry";
+            case handle_types::mutant:
+                return u"Mutant";
+            case handle_types::token:
+                return u"Token";
+            case handle_types::window:
+                return u"Window";
+            case handle_types::timer:
+                return u"Timer";
+            case handle_types::desktop:
+                return u"Desktop";
+            case handle_types::io_completion:
+                return u"IoCompletion";
+            case handle_types::wait_completion_packet:
+                return u"WaitCompletionPacket";
+            case handle_types::worker_factory:
+                return u"TpWorkerFactory";
+            case handle_types::private_namespace:
+                return u"Directory";
+            case handle_types::process:
+                return u"Process";
+            default:
+                return u"";
+            }
+        }
+
+        NTSTATUS handle_NtQueryObject(const syscall_context& c, const handle handle,
+                                      const OBJECT_INFORMATION_CLASS object_information_class, const emulator_pointer object_information,
+                                      const ULONG object_information_length, const emulator_object<ULONG> return_length)
+        {
+            const auto effective_handle = c.proc.resolve_object_pseudo_handle(handle, c.vcpu.active_thread);
+
+            if (object_information_class == ObjectNameInformation)
+            {
+                std::u16string device_path;
+                switch (effective_handle.value.type)
+                {
+                case handle_types::reserved: {
+                    return STATUS_NOT_SUPPORTED;
+                }
+
+                case handle_types::file: {
+                    const auto* file = c.proc.files.get(effective_handle);
+                    if (!file)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    device_path = windows_path(file->name).to_device_path();
+                    break;
+                }
+                case handle_types::device: {
+                    const auto* device = c.proc.devices.get(effective_handle);
+                    if (!device)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    device_path = device->get_device_path();
+                    break;
+                }
+                case handle_types::directory: {
+                    // Directory handles are pseudo handles representing specific object directories
+                    if (effective_handle == KNOWN_DLLS_DIRECTORY)
+                    {
+                        device_path = u"\\KnownDlls";
+                    }
+                    else if (effective_handle == KNOWN_DLLS32_DIRECTORY)
+                    {
+                        device_path = u"\\KnownDlls32";
+                    }
+                    else if (effective_handle == BASE_NAMED_OBJECTS_DIRECTORY)
+                    {
+                        device_path = u"\\Sessions\\1\\BaseNamedObjects";
+                    }
+                    else if (effective_handle == RPC_CONTROL_DIRECTORY)
+                    {
+                        device_path = u"\\RPC Control";
+                    }
+                    else
+                    {
+                        // Unknown directory handle
+                        return STATUS_INVALID_HANDLE;
+                    }
+                    break;
+                }
+                case handle_types::registry: {
+                    const auto* registry = c.proc.registry_keys.get(effective_handle);
+                    if (!registry)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    // Build the full registry path in device format
+                    auto registry_path = (registry->hive.get() / registry->path.get()).u16string();
+
+                    // Convert backslashes to forward slashes for consistency
+                    std::ranges::replace(registry_path, u'/', u'\\');
+
+                    // Convert to uppercase as Windows registry paths are case-insensitive
+                    std::ranges::transform(registry_path, registry_path.begin(), std::towupper);
+
+                    device_path = registry_path;
+                    break;
+                }
+                case handle_types::desktop: {
+                    const auto* desk = c.proc.desktops.get(effective_handle);
+                    if (!desk)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    device_path = u"\\Windows\\Desktop\\";
+                    device_path.append(desk->name);
+                    break;
+                }
+                case handle_types::io_completion: {
+                    const auto* io = c.proc.io_completions.get(effective_handle);
+                    if (!io)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    device_path = io->name;
+                    break;
+                }
+                case handle_types::wait_completion_packet: {
+                    const auto* packet = c.proc.wait_completion_packets.get(effective_handle);
+                    if (!packet)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    device_path = packet->name;
+                    break;
+                }
+                case handle_types::worker_factory: {
+                    const auto* factory = c.proc.worker_factories.get(effective_handle);
+                    if (!factory)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    device_path = factory->name;
+                    break;
+                }
+                case handle_types::private_namespace: {
+                    const auto* ns = c.proc.private_namespaces.get(effective_handle);
+                    if (!ns)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    break;
+                }
+                case handle_types::process: {
+                    if (effective_handle != GUEST_PROCESS_HANDLE)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    break;
+                }
+                case handle_types::thread: {
+                    const auto* thread = c.proc.threads.get(effective_handle);
+                    if (!thread)
+                    {
+                        return STATUS_INVALID_HANDLE;
+                    }
+
+                    break;
+                }
+                default:
+                    c.win_emu.log.error("Unsupported handle type for name information query: %X\n", effective_handle.value.type);
+                    c.emu.stop();
+                    return STATUS_NOT_SUPPORTED;
+                }
+
+                const auto required_size =
+                    sizeof(UNICODE_STRING<EmulatorTraits<Emu64>>) + ((device_path.size() + (device_path.empty() ? 0 : 1)) * 2);
+                return_length.write_if_valid(static_cast<ULONG>(required_size));
+
+                if (required_size > object_information_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                if (device_path.empty())
+                {
+                    UNICODE_STRING<EmulatorTraits<Emu64>> zero_buf{};
+                    c.emu.write_memory(object_information, zero_buf);
+                }
+                else
+                {
+                    emulator_allocator allocator(c.emu, object_information, object_information_length);
+                    allocator.make_unicode_string(device_path);
+                }
+
+                return STATUS_SUCCESS;
+            }
+
+            if (object_information_class == ObjectTypeInformation)
+            {
+                const auto name = get_type_name(static_cast<handle_types::type>(effective_handle.value.type));
+
+                const auto required_size = sizeof(OBJECT_TYPE_INFORMATION) + (name.size() + 1) * 2;
+                return_length.write_if_valid(static_cast<ULONG>(required_size));
+
+                if (required_size > object_information_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                emulator_allocator allocator(c.emu, object_information, object_information_length);
+                const auto info = allocator.reserve<OBJECT_TYPE_INFORMATION>();
+                info.access([&](OBJECT_TYPE_INFORMATION& i) {
+                    allocator.make_unicode_string(i.TypeName, name); //
+                });
+
+                return STATUS_SUCCESS;
+            }
+
+            if (object_information_class == ObjectTypesInformation)
+            {
+                const auto name = get_type_name(static_cast<handle_types::type>(effective_handle.value.type));
+                constexpr auto type_start_offset = align_up(sizeof(OBJECT_TYPES_INFORMATION), sizeof(uint64_t));
+
+                const auto required_size = type_start_offset + sizeof(OBJECT_TYPE_INFORMATION) + (name.size() + 1) * 2;
+                return_length.write_if_valid(static_cast<ULONG>(required_size));
+
+                if (required_size > object_information_length)
+                {
+                    return STATUS_BUFFER_TOO_SMALL;
+                }
+
+                emulator_allocator allocator(c.emu, object_information, object_information_length);
+                const auto types_info = allocator.reserve<OBJECT_TYPES_INFORMATION>();
+                types_info.access([&](OBJECT_TYPES_INFORMATION& i) {
+                    i.NumberOfTypes = 1; //
+                });
+
+                allocator.skip_until(type_start_offset);
+
+                const auto info = allocator.reserve<OBJECT_TYPE_INFORMATION>();
+                info.access([&](OBJECT_TYPE_INFORMATION& i) {
+                    allocator.make_unicode_string(i.TypeName, name); //
+                });
+
+                return STATUS_SUCCESS;
+            }
+
+            if (object_information_class == ObjectBasicInformation)
+            {
+                return handle_query<OBJECT_BASIC_INFORMATION>(c.emu, object_information, object_information_length, return_length,
+                                                              [&](OBJECT_BASIC_INFORMATION& info) {
+                                                                  info.GrantedAccess = GENERIC_ALL;
+                                                                  info.HandleCount = 1;
+                                                                  info.PointerCount = 2;
+                                                              });
+            }
+
+            if (object_information_class == ObjectHandleFlagInformation)
+            {
+                return handle_query<OBJECT_HANDLE_FLAG_INFORMATION>(c.emu, object_information, object_information_length, return_length,
+                                                                    [&](OBJECT_HANDLE_FLAG_INFORMATION& info) {
+                                                                        info.Inherit = 0;
+                                                                        info.ProtectFromClose = 0;
+                                                                    });
+            }
+
+            c.win_emu.log.error("Unsupported object info class: %X\n", object_information_class);
+            c.emu.stop();
+            return STATUS_NOT_SUPPORTED;
+        }
+
+        template <typename Store>
+        void collect_wait32_candidate(Store& store, const uint32_t id, std::optional<handle>& resolved, uint32_t& candidate_count)
+        {
+            if (!store.get_by_index(id))
+            {
+                return;
+            }
+
+            ++candidate_count;
+            if (!resolved)
+            {
+                resolved = store.make_handle(id);
+            }
+        }
+
+        std::optional<handle> resolve_wait32_handle(const syscall_context& c, const uint32_t raw_handle)
+        {
+            const auto decoded = make_handle(static_cast<uint64_t>(raw_handle));
+            if (decoded.value.type != handle_types::reserved)
+            {
+                return decoded;
+            }
+
+            // wait32 can give raw 32 bit handles without type bits
+            const auto id = static_cast<uint32_t>(decoded.value.id);
+            if (id == 0)
+            {
+                return std::nullopt;
+            }
+
+            std::optional<handle> resolved{};
+            uint32_t candidate_count = 0;
+
+            collect_wait32_candidate(c.proc.events, id, resolved, candidate_count);
+            collect_wait32_candidate(c.proc.threads, id, resolved, candidate_count);
+            collect_wait32_candidate(c.proc.mutants, id, resolved, candidate_count);
+            collect_wait32_candidate(c.proc.semaphores, id, resolved, candidate_count);
+            collect_wait32_candidate(c.proc.ports, id, resolved, candidate_count);
+            collect_wait32_candidate(c.proc.io_completions, id, resolved, candidate_count);
+            collect_wait32_candidate(c.proc.timers, id, resolved, candidate_count);
+
+            if (candidate_count == 1)
+            {
+                return resolved;
+            }
+
+            return std::nullopt;
+        }
+
+        // Resolve a handle for a wait operation: expand object pseudo handles, and recover the real typed
+        // handle for raw/un-typed (reserved) handles by matching their id against the waitable stores -- the
+        // same recovery the wait32 path does. WoW64 and some callers hand us handles without type bits.
+        handle resolve_wait_handle(const syscall_context& c, const handle h)
+        {
+            const auto resolved = c.proc.resolve_object_pseudo_handle(h, c.vcpu.active_thread);
+            if (resolved.value.type != handle_types::reserved || resolved.value.is_pseudo)
+            {
+                return resolved;
+            }
+
+            if (const auto recovered = resolve_wait32_handle(c, static_cast<uint32_t>(resolved.bits)))
+            {
+                return *recovered;
+            }
+
+            return resolved;
+        }
+
+        NTSTATUS validate_wait_handle(const syscall_context& c, const handle h)
+        {
+            const auto validate_handle_in_store = [&](auto& store) -> NTSTATUS {
+                return store.get(h) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
+            };
+
+            switch (h.value.type)
+            {
+            case handle_types::process:
+                // The synthetic Steam process never signals, so a liveness wait times out ("alive").
+                return (h == GUEST_PROCESS_HANDLE || h == STEAM_PROCESS_HANDLE) ? STATUS_SUCCESS : STATUS_INVALID_HANDLE;
+
+            case handle_types::file:
+                if (h.value.is_pseudo)
+                {
+                    return STATUS_SUCCESS;
+                }
+
+                return validate_handle_in_store(c.proc.files);
+
+            case handle_types::event:
+                if (h.value.is_pseudo)
+                {
+                    return STATUS_SUCCESS;
+                }
+
+                return validate_handle_in_store(c.proc.events);
+
+            case handle_types::thread:
+                return validate_handle_in_store(c.proc.threads);
+
+            case handle_types::mutant:
+                return validate_handle_in_store(c.proc.mutants);
+
+            case handle_types::semaphore:
+                return validate_handle_in_store(c.proc.semaphores);
+
+            case handle_types::port:
+                return validate_handle_in_store(c.proc.ports);
+
+            case handle_types::io_completion:
+                return validate_handle_in_store(c.proc.io_completions);
+
+            case handle_types::timer:
+                if (h.value.is_pseudo)
+                {
+                    return STATUS_SUCCESS;
+                }
+
+                return validate_handle_in_store(c.proc.timers);
+
+            case handle_types::reserved:
+                // A null or un-typed handle that resolve_wait_handle could not map to a waitable object.
+                // Windows returns STATUS_INVALID_HANDLE for this (e.g. waiting on a null handle, which the
+                // game does every frame and simply ignores) -- it is not an unsupported object type.
+                return STATUS_INVALID_HANDLE;
+
+            default:
+                c.win_emu.log.error("Wait handle type not supported: %u\n", static_cast<uint32_t>(h.value.type));
+                return STATUS_OBJECT_TYPE_MISMATCH;
+            }
+        }
+
+        NTSTATUS handle_NtCompareObjects(const syscall_context& c, const handle first, const handle second)
+        {
+            const auto first_resolved = c.proc.resolve_object_pseudo_handle(first, c.vcpu.active_thread);
+            const auto second_resolved = c.proc.resolve_object_pseudo_handle(second, c.vcpu.active_thread);
+            return (first_resolved == second_resolved) ? STATUS_SUCCESS : STATUS_NOT_SAME_OBJECT;
+        }
+
+        DWORD handle_NtUserMsgWaitForMultipleObjectsEx(const syscall_context& c, const ULONG count, const emulator_object<handle> handles,
+                                                       const DWORD timeout, const DWORD wake_mask, const DWORD flags)
+        {
+            constexpr DWORD mwmo_waitall = 0x0001;
+            constexpr DWORD wait_failed = 0xFFFFFFFF;
+            constexpr DWORD infinite_timeout = 0xFFFFFFFF;
+
+            if (count > 64)
+            {
+                return wait_failed;
+            }
+
+            const bool wait_all = (flags & mwmo_waitall) != 0;
+            auto& t = c.thread();
+            t.await_objects = {};
+            t.await_any = false;
+            t.await_msg_mask = {};
+            t.await_time = {};
+
+            std::vector<handle> wait_handles{};
+            wait_handles.reserve(count);
+            for (ULONG i = 0; i < count; ++i)
+            {
+                const auto h = handles.read(i);
+
+                if (c.proc.is_object_pseudo_handle(h))
+                {
+                    return wait_failed;
+                }
+
+                if (!NT_SUCCESS(validate_wait_handle(c, h)))
+                {
+                    return wait_failed;
+                }
+
+                wait_handles.push_back(h);
+            }
+
+            t.await_objects = std::move(wait_handles);
+            t.await_any = !wait_all;
+            if (wake_mask != 0)
+            {
+                t.await_msg_mask = wake_mask;
+            }
+
+            if (timeout != infinite_timeout)
+            {
+                t.await_time = c.win_emu.clock().steady_now() + std::chrono::milliseconds{timeout};
+            }
+
+            c.win_emu.yield_thread(c.vcpu, false);
+            return {};
+        }
+
+        NTSTATUS handle_NtWaitForMultipleObjects(const syscall_context& c, const ULONG count, const emulator_object<handle> handles,
+                                                 const WAIT_TYPE wait_type, const BOOLEAN alertable,
+                                                 const emulator_object<LARGE_INTEGER> timeout)
+        {
+            if (wait_type != WaitAny && wait_type != WaitAll)
+            {
+                c.win_emu.log.error("Wait type not supported!\n");
+                c.emu.stop();
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            if (count == 0 || count > 64) // MAXIMUM_WAIT_OBJECTS
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            auto& t = c.thread();
+            t.await_objects = {};
+            t.await_any = false;
+
+            std::vector<handle> wait_handles{};
+            wait_handles.reserve(count);
+
+            for (ULONG i = 0; i < count; ++i)
+            {
+                const auto raw_handle = handles.read(i);
+
+                // Unlike NtWaitForSingleObject, pseudo handles (current process/thread) are not allowed in
+                // NtWaitForMultipleObjects; Windows rejects them without resolving.
+                if (c.proc.is_object_pseudo_handle(raw_handle))
+                {
+                    t.await_time = {};
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                const auto h = resolve_wait_handle(c, raw_handle);
+
+                const auto validation_status = validate_wait_handle(c, h);
+                if (!NT_SUCCESS(validation_status))
+                {
+                    t.await_time = {};
+                    return validation_status;
+                }
+
+                wait_handles.push_back(h);
+            }
+
+            t.await_objects = std::move(wait_handles);
+            t.await_any = wait_type == WaitAny;
+
+            if (timeout.value() && !t.await_time.has_value())
+            {
+                t.await_time = utils::convert_delay_interval_to_time_point(c.win_emu.clock(), timeout.read());
+            }
+
+            c.win_emu.yield_thread(c.vcpu, alertable);
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtWaitForMultipleObjects32(const syscall_context& c, const ULONG count, const emulator_object<uint32_t> handles,
+                                                   const WAIT_TYPE wait_type, const BOOLEAN alertable,
+                                                   const emulator_object<LARGE_INTEGER> timeout)
+        {
+            if (wait_type != WaitAny && wait_type != WaitAll)
+            {
+                c.win_emu.log.error("Wait type not supported!\n");
+                c.emu.stop();
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            if (count == 0 || count > 64) // MAXIMUM_WAIT_OBJECTS
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            auto& t = c.thread();
+            t.await_objects = {};
+            t.await_any = false;
+
+            std::vector<handle> wait_handles{};
+            wait_handles.reserve(count);
+
+            for (ULONG i = 0; i < count; ++i)
+            {
+                const auto raw_handle = handles.read(i);
+                const auto h = resolve_wait32_handle(c, raw_handle);
+                if (!h)
+                {
+                    t.await_time = {};
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                if (c.proc.is_object_pseudo_handle(*h))
+                {
+                    t.await_time = {};
+                    return STATUS_INVALID_HANDLE;
+                }
+
+                const auto validation_status = validate_wait_handle(c, *h);
+                if (!NT_SUCCESS(validation_status))
+                {
+                    t.await_time = {};
+                    return validation_status;
+                }
+
+                wait_handles.push_back(*h);
+            }
+
+            t.await_objects = std::move(wait_handles);
+            t.await_any = wait_type == WaitAny;
+
+            if (timeout.value() && !t.await_time.has_value())
+            {
+                t.await_time = utils::convert_delay_interval_to_time_point(c.win_emu.clock(), timeout.read());
+            }
+
+            c.win_emu.yield_thread(c.vcpu, alertable);
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtWaitForSingleObject(const syscall_context& c, const handle h, const BOOLEAN alertable,
+                                              const emulator_object<LARGE_INTEGER> timeout)
+        {
+            const auto resolved_handle = resolve_wait_handle(c, h);
+            const auto validation_status = validate_wait_handle(c, resolved_handle);
+            if (!NT_SUCCESS(validation_status))
+            {
+                return validation_status;
+            }
+
+            auto& t = c.thread();
+            t.await_objects = {resolved_handle};
+            t.await_any = false;
+
+            if (timeout.value() && !t.await_time.has_value())
+            {
+                t.await_time = utils::convert_delay_interval_to_time_point(c.win_emu.clock(), timeout.read());
+            }
+
+            c.win_emu.yield_thread(c.vcpu, alertable);
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtSignalAndWaitForSingleObject(const syscall_context& c, const handle signal_handle, const handle wait_handle,
+                                                       const BOOLEAN alertable, const emulator_object<LARGE_INTEGER> timeout)
+        {
+            const emulator_object<LONG> no_previous_state{c.emu.memory()};
+
+            NTSTATUS signal_status{};
+
+            switch (signal_handle.value.type)
+            {
+            case handle_types::event:
+                signal_status = handle_NtSetEvent(c, signal_handle.bits, no_previous_state);
+                break;
+
+            case handle_types::mutant:
+                signal_status = handle_NtReleaseMutant(c, signal_handle, no_previous_state);
+                break;
+
+            case handle_types::semaphore:
+                signal_status = handle_NtReleaseSemaphore(c, signal_handle, 1, no_previous_state);
+                break;
+
+            default:
+                return STATUS_OBJECT_TYPE_MISMATCH;
+            }
+
+            if (!NT_SUCCESS(signal_status))
+            {
+                return signal_status;
+            }
+
+            return handle_NtWaitForSingleObject(c, wait_handle, alertable, timeout);
+        }
+
+        NTSTATUS handle_NtSetInformationObject(const syscall_context& c, const handle handle,
+                                               const OBJECT_INFORMATION_CLASS object_information_class,
+                                               const emulator_pointer object_information, const ULONG object_information_length)
+        {
+            if (object_information_class != ObjectHandleFlagInformation)
+            {
+                c.win_emu.log.error("Unsupported object info class: %X\n", object_information_class);
+                return STATUS_NOT_SUPPORTED;
+            }
+
+            if (object_information_length < sizeof(OBJECT_HANDLE_FLAG_INFORMATION))
+            {
+                return STATUS_INFO_LENGTH_MISMATCH;
+            }
+
+            const auto effective_handle = c.proc.resolve_object_pseudo_handle(handle, c.vcpu.active_thread);
+            if (!c.proc.get_handle_store(effective_handle))
+            {
+                return STATUS_INVALID_HANDLE;
+            }
+
+            // Validate the buffer, then drop the flags: NtQueryObject reports both
+            // as 0 because neither is tracked per handle. Failing instead breaks
+            // callers that only set them defensively -- winhttp aborts session
+            // creation with ERROR_NOT_SUPPORTED and returns a NULL session.
+            const emulator_object<OBJECT_HANDLE_FLAG_INFORMATION> info{c.emu, object_information};
+            (void)info.read();
+
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtQuerySecurityObject(const syscall_context& c, const handle /*h*/, const SECURITY_INFORMATION security_information,
+                                              const emulator_pointer security_descriptor, const ULONG length,
+                                              const emulator_object<ULONG> length_needed)
+        {
+            if ((security_information &
+                 (OWNER_SECURITY_INFORMATION | GROUP_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION | LABEL_SECURITY_INFORMATION)) == 0)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            // Owner SID: S-1-5-32-544 (Administrators)
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+            const uint8_t owner_sid[] = {0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00};
+
+            // Group SID: S-1-5-18 (Local System)
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+            const uint8_t group_sid[] = {0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x12, 0x00, 0x00, 0x00};
+
+            // DACL structure
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+            const uint8_t dacl_data[] = {
+                0x02, 0x00, 0x9C, 0x00, 0x07, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x0F, 0x00, 0x02, 0x00, 0x01, 0x01, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x14, 0x00, 0x0F, 0x00, 0x02, 0x00, 0x01, 0x01, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x05, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x00, 0x18, 0x00, 0x0F, 0x00, 0x0F, 0x00, 0x01, 0x02, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x14, 0x00, 0x00, 0x00, 0x00, 0xE0,
+                0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x14, 0x00, 0x00, 0x00, 0x00, 0xE0,
+                0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x0C, 0x00, 0x00, 0x00, 0x00, 0x0B, 0x18, 0x00, 0x00, 0x00, 0x00, 0x10,
+                0x01, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 0x20, 0x00, 0x00, 0x00, 0x20, 0x02, 0x00, 0x00, 0x00, 0x0B, 0x14, 0x00,
+                0x00, 0x00, 0x00, 0x10, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00, 0x00};
+
+            // SACL structure
+            // NOLINTNEXTLINE(cppcoreguidelines-avoid-c-arrays,hicpp-avoid-c-arrays,modernize-avoid-c-arrays)
+            const uint8_t sacl_data[] = {0x02, 0x00, 0x1C, 0x00, 0x01, 0x00, 0x00, 0x00, 0x11, 0x00, 0x14, 0x00, 0x01, 0x00,
+                                         0x00, 0x00, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x10, 0x00, 0x10, 0x00, 0x00};
+
+            ULONG total_size = sizeof(SECURITY_DESCRIPTOR_RELATIVE);
+
+            if (security_information & OWNER_SECURITY_INFORMATION)
+            {
+                total_size += sizeof(owner_sid);
+            }
+
+            if (security_information & GROUP_SECURITY_INFORMATION)
+            {
+                total_size += sizeof(group_sid);
+            }
+
+            if (security_information & DACL_SECURITY_INFORMATION)
+            {
+                total_size += sizeof(dacl_data);
+            }
+
+            if (security_information & LABEL_SECURITY_INFORMATION)
+            {
+                total_size += sizeof(sacl_data);
+            }
+
+            length_needed.write(total_size);
+
+            if (length < total_size)
+            {
+                return STATUS_BUFFER_TOO_SMALL;
+            }
+
+            if (!security_descriptor)
+            {
+                return STATUS_INVALID_PARAMETER;
+            }
+
+            SECURITY_DESCRIPTOR_RELATIVE sd = {};
+            sd.Revision = SECURITY_DESCRIPTOR_REVISION;
+            sd.Control = SE_SELF_RELATIVE;
+
+            ULONG current_offset = sizeof(sd);
+
+            if (security_information & OWNER_SECURITY_INFORMATION)
+            {
+                sd.Owner = current_offset;
+                c.emu.write_memory(security_descriptor + current_offset, owner_sid);
+                current_offset += sizeof(owner_sid);
+            }
+
+            if (security_information & GROUP_SECURITY_INFORMATION)
+            {
+                sd.Group = current_offset;
+                c.emu.write_memory(security_descriptor + current_offset, group_sid);
+                current_offset += sizeof(group_sid);
+            }
+
+            if (security_information & DACL_SECURITY_INFORMATION)
+            {
+                sd.Control |= SE_DACL_PRESENT;
+                sd.Dacl = current_offset;
+                c.emu.write_memory(security_descriptor + current_offset, dacl_data);
+                current_offset += sizeof(dacl_data);
+            }
+
+            if (security_information & LABEL_SECURITY_INFORMATION)
+            {
+                sd.Control |= SE_SACL_PRESENT | SE_SACL_AUTO_INHERITED;
+                sd.Sacl = current_offset;
+                c.emu.write_memory(security_descriptor + current_offset, sacl_data);
+                current_offset += sizeof(sacl_data);
+            }
+
+            assert(current_offset == total_size);
+
+            c.emu.write_memory(security_descriptor, sd);
+
+            return STATUS_SUCCESS;
+        }
+
+        NTSTATUS handle_NtSetSecurityObject()
+        {
+            return STATUS_SUCCESS;
+        }
+    }
+
+} // namespace sogen

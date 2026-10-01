@@ -1,0 +1,53 @@
+import { ThemeProvider } from "@/components/theme-provider";
+import { TooltipProvider } from "@/components/ui/tooltip";
+import { HashRouter, Route, Routes, Navigate } from "react-router-dom";
+import { Playground, storeEmulateData } from "./playground";
+import { InstallPrompt } from "./components/install-prompt";
+import { LandingPage } from "./landing-page";
+import { useParams } from "react-router-dom";
+import Loader from "./Loader";
+
+import "@fontsource/inter/latin.css";
+
+import "./App.css";
+import "./animation.css";
+
+function EmulateFile() {
+  const { encodedData } = useParams();
+  storeEmulateData(encodedData);
+  return <Navigate to="/playground" replace />;
+}
+
+function Spinner() {
+  const loading = Loader.useLoader();
+
+  return (
+    <div
+      className={
+        "fixed z-9999 top-0 left-0 right-0 h-[2px] pointer-events-none select-none transition-opacity duration-1000 animated-gradient " +
+        (loading ? "opacity-100" : "opacity-0")
+      }
+    ></div>
+  );
+}
+
+function App() {
+  return (
+    <ThemeProvider defaultTheme="dark" storageKey="vite-ui-theme">
+      <TooltipProvider>
+        <HashRouter>
+          <Routes>
+            <Route path="*" element={<Navigate to="/" replace />} />
+            <Route path="/" element={<LandingPage />} />
+            <Route path="/playground" element={<Playground />} />
+            <Route path="/emulate/:encodedData?" element={<EmulateFile />} />
+          </Routes>
+        </HashRouter>
+        <Spinner />
+        <InstallPrompt />
+      </TooltipProvider>
+    </ThemeProvider>
+  );
+}
+
+export default App;

@@ -1,0 +1,432 @@
+#include "address.hpp"
+
+#include <array>
+#include <charconv>
+#include <stdexcept>
+
+#include "../utils/finally.hpp"
+
+using namespace std::literals;
+
+namespace sogen::network
+{
+    void initialize_wsa()
+    {
+#ifdef _WIN32
+        static struct wsa_initializer
+        {
+            wsa_initializer()
+            {
+                WSADATA wsa_data;
+                if (WSAStartup(MAKEWORD(2, 2), &wsa_data))
+                {
+                    throw std::runtime_error("Unable to initialize WSA");
+                }
+            }
+
+            ~wsa_initializer()
+            {
+                WSACleanup();
+            }
+        } _;
+#endif
+    }
+
+    namespace
+    {
+        std::optional<uint16_t> parse_port(const std::string_view port)
+        {
+            if (port.empty())
+            {
+                return std::nullopt;
+            }
+
+            uint16_t parsed_port{};
+            const auto [ptr, ec] = std::from_chars(port.data(), port.data() + port.size(), parsed_port);
+            if (ec == std::errc{} && ptr == port.data() + port.size())
+            {
+                return parsed_port;
+            }
+
+            return std::nullopt;
+        }
+    }
+
+    address::address()
+    {
+        initialize_wsa();
+        ZeroMemory(&this->storage_, this->get_max_size());
+
+        this->address_.sa_family = AF_UNSPEC;
+    }
+
+    address::address(const std::string_view addr, const std::optional<int>& family)
+        : address()
+    {
+        this->parse(addr, family);
+    }
+
+    address::address(const std::string& addr, const uint16_t port)
+        : address()
+    {
+        this->resolve(addr, std::nullopt);
+        this->set_port(port);
+    }
+
+    address::address(const sockaddr_in6& addr)
+        : address()
+    {
+        this->address6_ = addr;
+    }
+
+    address::address(const sockaddr_in& addr)
+        : address()
+    {
+        this->address4_ = addr;
+    }
+
+    address::address(const sockaddr* addr, const socklen_t length)
+        : address()
+    {
+        this->set_address(addr, length);
+    }
+
+    void address::set_ipv4(const uint32_t ip)
+    {
+        in_addr addr{};
+        addr.s_addr = ip;
+        this->set_ipv4(addr);
+    }
+
+    bool address::operator==(const address& obj) const
+    {
+        if (this->get_family() != obj.get_family())
+        {
+            return false;
+        }
+
+        if (this->get_port() != obj.get_port())
+        {
+            return false;
+        }
+
+        if (this->is_ipv4())
+        {
+            return this->address4_.sin_addr.s_addr == obj.address4_.sin_addr.s_addr;
+        }
+
+        if (this->is_ipv6())
+        {
+            return !memcmp(this->address6_.sin6_addr.s6_addr, obj.address6_.sin6_addr.s6_addr, sizeof(obj.address6_.sin6_addr.s6_addr));
+        }
+
+        return false;
+    }
+
+    void address::set_ipv4(const in_addr& addr)
+    {
+        ZeroMemory(&this->address4_, sizeof(this->address4_));
+        this->address4_.sin_family = AF_INET;
+        this->address4_.sin_addr = addr;
+    }
+
+    void address::set_ipv6(const in6_addr& addr)
+    {
+        ZeroMemory(&this->address6_, sizeof(this->address6_));
+        this->address6_.sin6_family = AF_INET6;
+        this->address6_.sin6_addr = addr;
+    }
+
+    void address::set_address(const sockaddr* addr, const socklen_t length)
+    {
+        if (static_cast<size_t>(length) >= sizeof(sockaddr_in) && addr->sa_family == AF_INET)
+        {
+            this->address4_ = *reinterpret_cast<const sockaddr_in*>(addr);
+        }
+        else if (static_cast<size_t>(length) == sizeof(sockaddr_in6) && addr->sa_family == AF_INET6)
+        {
+            this->address6_ = *reinterpret_cast<const sockaddr_in6*>(addr);
+        }
+        else
+        {
+            throw std::runtime_error("Invalid network address");
+        }
+    }
+
+    void address::set_port(const uint16_t port)
+    {
+        switch (this->get_family())
+        {
+        case AF_INET:
+            this->address4_.sin_port = htons(port);
+            break;
+        case AF_INET6:
+            this->address6_.sin6_port = htons(port);
+            break;
+        default:
+            throw std::runtime_error("Invalid address family");
+        }
+    }
+
+    uint16_t address::get_port() const
+    {
+        switch (this->get_family())
+        {
+        case AF_INET:
+            return ntohs(this->address4_.sin_port);
+        case AF_INET6:
+            return ntohs(this->address6_.sin6_port);
+        default:
+            return 0;
+        }
+    }
+
+    std::string address::to_string() const
+    {
+        std::string addr{};
+        std::array<char, 1000> buffer{};
+
+        switch (this->get_family())
+        {
+        case AF_INET:
+            inet_ntop(this->get_family(), &this->address4_.sin_addr, buffer.data(), buffer.size());
+            addr = std::string(buffer.data());
+            break;
+        case AF_INET6:
+            inet_ntop(this->get_family(), &this->address6_.sin6_addr, buffer.data(), buffer.size());
+            addr = "[" + std::string(buffer.data()) + "]";
+            break;
+        default:
+            addr = "?";
+            break;
+        }
+
+        return addr + ":" + std::to_string(this->get_port());
+    }
+
+    bool address::is_local() const
+    {
+        if (!this->is_ipv4())
+        {
+            return false;
+        }
+
+        // According to: https://en.wikipedia.org/wiki/Private_network
+
+        std::array<uint8_t, 4> bytes{};
+        memcpy(bytes.data(), &this->address4_.sin_addr.s_addr, bytes.size());
+
+        // 10.X.X.X
+        if (bytes.at(0) == 10)
+        {
+            return true;
+        }
+
+        // 192.168.X.X
+        if (bytes.at(0) == 192 && bytes.at(1) == 168)
+        {
+            return true;
+        }
+
+        // 172.16.X.X - 172.31.X.X
+        if (bytes.at(0) == 172 && bytes.at(1) >= 16 && bytes.at(1) < 32)
+        {
+            return true;
+        }
+
+        // 127.0.0.1
+        if (this->address4_.sin_addr.s_addr == 0x0100007F)
+        {
+            return true;
+        }
+
+        return false;
+    }
+
+    sockaddr& address::get_addr()
+    {
+        return this->address_;
+    }
+
+    const sockaddr& address::get_addr() const
+    {
+        return this->address_;
+    }
+
+    sockaddr_in& address::get_in_addr()
+    {
+        return this->address4_;
+    }
+
+    sockaddr_in6& address::get_in6_addr()
+    {
+        return this->address6_;
+    }
+
+    const sockaddr_in& address::get_in_addr() const
+    {
+        return this->address4_;
+    }
+
+    const sockaddr_in6& address::get_in6_addr() const
+    {
+        return this->address6_;
+    }
+
+    socklen_t address::get_size() const
+    {
+        switch (this->get_family())
+        {
+        case AF_INET:
+            return static_cast<socklen_t>(sizeof(this->address4_));
+        case AF_INET6:
+            return static_cast<socklen_t>(sizeof(this->address6_));
+        default:
+            return static_cast<socklen_t>(sizeof(this->address_));
+        }
+    }
+
+    socklen_t address::get_max_size() const
+    {
+        constexpr auto s = sizeof(this->address_);
+        constexpr auto s4 = sizeof(this->address4_);
+        constexpr auto s6 = sizeof(this->address6_);
+        constexpr auto sstore = sizeof(this->storage_);
+        constexpr auto max_size = std::max(sstore, std::max(s, std::max(s4, s6)));
+        static_assert(max_size == sstore);
+
+        return static_cast<socklen_t>(max_size);
+    }
+
+    int address::get_family() const
+    {
+        return this->address_.sa_family;
+    }
+
+    bool address::is_ipv4() const
+    {
+        return this->get_family() == AF_INET;
+    }
+
+    bool address::is_ipv6() const
+    {
+        return this->get_family() == AF_INET6;
+    }
+
+    bool address::is_supported() const
+    {
+        return is_ipv4() || is_ipv6();
+    }
+
+    void address::parse(std::string_view addr, const std::optional<int>& family)
+    {
+        std::optional<uint16_t> port_value{};
+
+        if (!addr.empty() && addr.front() == '[')
+        {
+            const auto close = addr.find(']');
+            if (close != std::string_view::npos)
+            {
+                if (close + 1 == addr.size())
+                {
+                    addr = addr.substr(1, close - 1);
+                }
+                else if (addr.at(close + 1) == ':')
+                {
+                    if (const auto parsed_port = parse_port(addr.substr(close + 2)))
+                    {
+                        port_value = parsed_port;
+                        addr = addr.substr(1, close - 1);
+                    }
+                }
+            }
+        }
+        else
+        {
+            const auto first_colon = addr.find(':');
+            if (first_colon != std::string_view::npos && addr.find(':', first_colon + 1) == std::string_view::npos)
+            {
+                if (const auto parsed_port = parse_port(addr.substr(first_colon + 1)))
+                {
+                    port_value = parsed_port;
+                    addr = addr.substr(0, first_colon);
+                }
+            }
+        }
+
+        this->resolve(std::string(addr), family);
+
+        if (port_value)
+        {
+            this->set_port(*port_value);
+        }
+    }
+
+    void address::resolve(const std::string& hostname, const std::optional<int>& family)
+    {
+        const auto port = this->get_port();
+        auto port_reset_action = utils::finally([this, port]() { this->set_port(port); });
+
+        const auto result = resolve_multiple(hostname);
+        for (const auto& addr : result)
+        {
+            if (addr.is_supported() && (!family || addr.get_addr().sa_family == *family))
+            {
+                this->set_address(&addr.get_addr(), addr.get_size());
+                return;
+            }
+        }
+
+        port_reset_action.cancel();
+        throw std::runtime_error{"Unable to resolve hostname: " + hostname};
+    }
+
+    std::vector<address> address::resolve_multiple(const std::string& hostname)
+    {
+        std::vector<address> results{};
+
+        addrinfo* result = nullptr;
+        if (!getaddrinfo(hostname.data(), nullptr, nullptr, &result))
+        {
+            const auto _2 = utils::finally([&result] { freeaddrinfo(result); });
+
+            for (const auto* i = result; i; i = i->ai_next)
+            {
+                if (i->ai_family == AF_INET || i->ai_family == AF_INET6)
+                {
+                    address a{};
+                    a.set_address(i->ai_addr, static_cast<socklen_t>(i->ai_addrlen));
+                    results.emplace_back(a);
+                }
+            }
+        }
+
+        return results;
+    }
+}
+
+namespace std
+{
+    std::size_t hash<sogen::network::address>::operator()(const sogen::network::address& a) const noexcept
+    {
+        const uint32_t family = a.get_addr().sa_family;
+        const uint32_t port = a.get_port();
+
+        std::size_t hash = std::hash<uint32_t>{}(family);
+        hash ^= std::hash<uint32_t>{}(port);
+        switch (a.get_addr().sa_family)
+        {
+        case AF_INET:
+            hash ^= std::hash<decltype(a.get_in_addr().sin_addr.s_addr)>{}(a.get_in_addr().sin_addr.s_addr);
+            break;
+        case AF_INET6:
+            hash ^= std::hash<std::string_view>{}(std::string_view{reinterpret_cast<const char*>(a.get_in6_addr().sin6_addr.s6_addr),
+                                                                   sizeof(a.get_in6_addr().sin6_addr.s6_addr)});
+            break;
+        default:
+            break;
+        }
+
+        return hash;
+    }
+}

@@ -1,0 +1,2054 @@
+#include <cstdint>
+#include <cinttypes>
+#include <cstring>
+#include <string>
+#include <fstream>
+#include <thread>
+#include <atomic>
+#include <vector>
+#include <optional>
+#include <filesystem>
+#include <string_view>
+#include <array>
+
+#include "../../common/utils/finally.hpp"
+
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#define WIN32_LEAN_AND_MEAN
+#include <intrin.h>
+
+#include <windows.h>
+#include <timeapi.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windns.h>
+#include <shlobj.h>
+#include <combaseapi.h>
+#include <knownfolders.h>
+#include <sddl.h>
+#include <bcrypt.h>
+
+using namespace std::literals;
+
+// Externally visible and potentially modifiable state
+// to trick compiler optimizations
+__declspec(dllexport) bool do_the_task = true;
+
+namespace
+{
+    struct tls_struct
+    {
+        DWORD num = 1337;
+
+        tls_struct()
+        {
+            num = GetCurrentThreadId();
+        }
+    };
+
+    thread_local tls_struct tls_var{};
+
+    // getenv is broken right now :(
+    std::string read_env(const char* env)
+    {
+        std::array<char, 0x1000> buffer{};
+        if (!GetEnvironmentVariableA(env, buffer.data(), static_cast<DWORD>(buffer.size())))
+        {
+            return {};
+        }
+
+        return buffer.data();
+    }
+
+    bool test_threads()
+    {
+        constexpr auto thread_count = 5ULL;
+
+        std::atomic<uint64_t> counter{0};
+
+        std::vector<std::thread> threads{};
+        threads.reserve(thread_count);
+
+        for (auto i = 0ULL; i < thread_count; ++i)
+        {
+            threads.emplace_back([&counter] {
+                ++counter;
+                std::this_thread::yield();
+                ++counter;
+                // Host scheduling/cpu performance can have impact on emulator scheduling
+                // std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                ++counter;
+            });
+        }
+
+        for (auto& t : threads)
+        {
+            t.join();
+        }
+
+        return counter == (thread_count * 3ULL);
+    }
+
+    bool test_threads_winapi()
+    {
+        struct ctx_t
+        {
+            int iterations;
+            int result;
+        };
+
+        static LPTHREAD_START_ROUTINE thread_proc = [](LPVOID lpParameter) -> DWORD {
+            ctx_t& c = *static_cast<ctx_t*>(lpParameter);
+            c.result = 0;
+            for (int i = 1; i <= c.iterations; i++)
+            {
+                ++c.result;
+            }
+            return 0;
+        };
+
+        constexpr int thread_count = 5;
+        std::array<HANDLE, thread_count> threads = {};
+        std::array<ctx_t, thread_count> ctxs = {};
+
+        for (int i = 0; i < thread_count; i++)
+        {
+            ctxs[i] = {.iterations = 5 * (i + 1), .result = 0};
+            threads[i] = CreateThread(nullptr, 0, thread_proc, &ctxs[i], 0, nullptr);
+            if (!threads[i])
+            {
+                return false;
+            }
+        }
+
+        WaitForMultipleObjects(thread_count, threads.data(), TRUE, INFINITE);
+
+        const std::array<int, thread_count> expected_results = {5, 10, 15, 20, 25};
+        for (int i = 0; i < thread_count; i++)
+        {
+            if (ctxs[i].result != expected_results[i])
+            {
+                return false;
+            }
+            CloseHandle(threads[i]);
+        }
+
+        return true;
+    }
+
+    bool test_tls()
+    {
+        std::atomic_bool kill{false};
+        std::atomic_uint32_t successes{0};
+        constexpr uint32_t thread_count = 2;
+
+        std::vector<std::thread> ts{};
+        kill = false;
+
+        ts.reserve(thread_count);
+        for (size_t i = 0; i < thread_count; ++i)
+        {
+            ts.emplace_back([&] {
+                while (!kill)
+                {
+                    std::this_thread::yield();
+                }
+
+                if (tls_var.num == GetCurrentThreadId())
+                {
+                    ++successes;
+                }
+            });
+        }
+
+        LoadLibraryA("d3dcompiler_47.dll");
+        LoadLibraryA("dsound.dll");
+        LoadLibraryA("comctl32.dll");
+        /*LoadLibraryA("d3d9.dll");
+        LoadLibraryA("dxgi.dll");
+        LoadLibraryA("wlanapi.dll");*/
+
+        kill = true;
+
+        for (auto& t : ts)
+        {
+            if (t.joinable())
+            {
+                t.join();
+            }
+        }
+
+        return successes == thread_count;
+    }
+
+    bool test_env()
+    {
+        const auto computername = read_env("COMPUTERNAME");
+
+        SetEnvironmentVariableA("BLUB", "LUL");
+
+        const auto blub = read_env("BLUB");
+
+        return !computername.empty() && blub == "LUL";
+    }
+
+    bool test_lookup_account_sid()
+    {
+        HANDLE token{};
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &token))
+        {
+            return false;
+        }
+
+        const auto close_token = sogen::utils::finally([&] { CloseHandle(token); });
+
+        DWORD size = 0;
+        GetTokenInformation(token, TokenUser, nullptr, 0, &size);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || size < sizeof(TOKEN_USER))
+        {
+            return false;
+        }
+
+        std::vector<std::byte> buffer(size);
+        if (!GetTokenInformation(token, TokenUser, buffer.data(), size, &size))
+        {
+            return false;
+        }
+
+        const auto& token_user = *reinterpret_cast<const TOKEN_USER*>(buffer.data());
+        if (token_user.User.Sid == nullptr || IsValidSid(token_user.User.Sid) == FALSE)
+        {
+            return false;
+        }
+
+        DWORD name_size = 0;
+        DWORD domain_size = 0;
+        SID_NAME_USE use = SidTypeUnknown;
+
+        LookupAccountSidW(nullptr, token_user.User.Sid, nullptr, &name_size, nullptr, &domain_size, &use);
+        if (GetLastError() != ERROR_INSUFFICIENT_BUFFER || name_size == 0 || domain_size == 0)
+        {
+            return false;
+        }
+
+        std::wstring name(name_size, L'\0');
+        std::wstring domain(domain_size, L'\0');
+
+        if (!LookupAccountSidW(nullptr, token_user.User.Sid, name.data(), &name_size, domain.data(), &domain_size, &use))
+        {
+            return false;
+        }
+
+        name.resize(name_size);
+        domain.resize(domain_size);
+
+        return !name.empty() && !domain.empty() && use == SidTypeUser;
+    }
+
+    bool test_file_path_io(const std::filesystem::path& filename)
+    {
+        std::error_code ec{};
+        const auto absolute_file = absolute(filename, ec);
+        (void)absolute_file;
+
+        if (ec)
+        {
+            puts("Getting absolute path failed");
+            return false;
+        }
+
+        const auto canonical_file = canonical(filename, ec);
+        (void)canonical_file;
+
+        if (ec)
+        {
+            puts("Getting canonical path failed");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_io()
+    {
+        const std::filesystem::path filename1 = "a.txt";
+        const std::filesystem::path filename2 = "A.tXt";
+
+        FILE* fp{};
+        (void)fopen_s(&fp, filename1.string().c_str(), "wb");
+
+        if (!fp)
+        {
+            puts("Bad file");
+            return false;
+        }
+
+        const std::string text = "Blub";
+
+        (void)fwrite(text.data(), 1, text.size(), fp);
+        (void)fclose(fp);
+
+        if (!test_file_path_io(filename1))
+        {
+            return false;
+        }
+
+        std::ifstream t(filename2);
+        t.seekg(0, std::ios::end);
+        const size_t size = static_cast<size_t>(t.tellg());
+        std::string buffer(size, ' ');
+        t.seekg(0);
+        t.read(buffer.data(), static_cast<std::streamsize>(size));
+
+        return text == buffer;
+    }
+
+    bool test_file_locking()
+    {
+        const auto filename = std::filesystem::absolute("a.txt");
+        constexpr DWORD pending_byte = 0x40000000UL;
+
+        const auto cleanup_file = sogen::utils::finally([&] { DeleteFileW(filename.c_str()); });
+
+        HANDLE first = CreateFileW(filename.c_str(), GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                   nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (first == INVALID_HANDLE_VALUE)
+        {
+            puts("Failed to create first lock handle");
+            return false;
+        }
+
+        const auto cleanup_first = sogen::utils::finally([&] { CloseHandle(first); });
+
+        OVERLAPPED first_lock{};
+        first_lock.Offset = pending_byte;
+        if (!LockFileEx(first, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &first_lock))
+        {
+            puts("Failed to acquire first file lock");
+            return false;
+        }
+
+        if (!UnlockFileEx(first, 0, 1, 0, &first_lock))
+        {
+            puts("Failed to unlock first file lock");
+            return false;
+        }
+
+        OVERLAPPED second_lock{};
+        second_lock.Offset = pending_byte + 1;
+        if (!LockFileEx(first, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, 1, 0, &second_lock))
+        {
+            puts("Failed to reacquire file lock");
+            return false;
+        }
+
+        if (!UnlockFileEx(first, 0, 1, 0, &second_lock))
+        {
+            puts("Failed to unlock reacquired file lock");
+            return false;
+        }
+
+        constexpr DWORD negative_length_low = 0xFFFFFFFFUL;
+        constexpr DWORD negative_length_high = 0xFFFFFFFFUL;
+
+        OVERLAPPED negative_lock{};
+        if (!LockFileEx(first, LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY, 0, negative_length_low, negative_length_high,
+                        &negative_lock))
+        {
+            puts("Failed to acquire negative-length file lock");
+            return false;
+        }
+
+        if (!UnlockFileEx(first, 0, negative_length_low, negative_length_high, &negative_lock))
+        {
+            puts("Failed to unlock negative-length file lock");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_working_directory()
+    {
+        std::error_code ec{};
+
+        const auto current_dir = std::filesystem::current_path(ec);
+        if (ec)
+        {
+            puts("Failed to get current path");
+            return false;
+        }
+
+        const std::filesystem::path sys32 = "C:/windows/system32";
+        current_path(sys32, ec);
+
+        if (ec)
+        {
+            puts("Failed to update working directory");
+            return false;
+        }
+
+        const auto new_current_dir = std::filesystem::current_path();
+        if (sys32 != new_current_dir)
+        {
+            puts("Updated directory is wrong!");
+            return false;
+        }
+
+        if (!std::ifstream("ntdll.dll"))
+        {
+            puts("Working directory is not active!");
+            return false;
+        }
+
+        current_path(current_dir);
+        return std::filesystem::current_path() == current_dir;
+    }
+
+    bool test_dir_io()
+    {
+        size_t count = 0;
+
+        for (auto i : std::filesystem::directory_iterator(R"(C:\Windows\System32\)"))
+        {
+            ++count;
+            if (count > 30)
+            {
+                return true;
+            }
+        }
+
+        return count > 30;
+    }
+
+    std::optional<std::string> read_registry_string(const HKEY root, const char* path, const char* value)
+    {
+        HKEY key{};
+        if (RegOpenKeyExA(root, path, 0, KEY_READ, &key) != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        std::array<char, MAX_PATH> data{};
+        auto length = static_cast<DWORD>(data.size());
+        const auto res = RegQueryValueExA(key, value, nullptr, nullptr, reinterpret_cast<uint8_t*>(data.data()), &length);
+
+        if (RegCloseKey(key) != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        if (res != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        if (length == 0)
+        {
+            return "";
+        }
+
+        return {std::string(data.data(), std::min(static_cast<size_t>(length - 1), data.size()))};
+    }
+
+    std::optional<std::vector<std::string>> get_all_registry_keys(const HKEY root, const char* path)
+    {
+        HKEY key{};
+        if (RegOpenKeyExA(root, path, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        std::vector<std::string> keys;
+        std::vector<char> name_buffer(MAX_PATH + 1);
+
+        for (DWORD i = 0;; ++i)
+        {
+            auto name_buffer_len = static_cast<DWORD>(name_buffer.size());
+            const LSTATUS status = RegEnumKeyExA(key, i, name_buffer.data(), &name_buffer_len, nullptr, nullptr, nullptr, nullptr);
+            if (status == ERROR_SUCCESS)
+            {
+                keys.emplace_back(name_buffer.data(), name_buffer_len);
+            }
+            else if (status == ERROR_NO_MORE_ITEMS)
+            {
+                break;
+            }
+            else
+            {
+                keys.clear();
+                break;
+            }
+        }
+
+        if (keys.empty())
+        {
+            RegCloseKey(key);
+            return std::nullopt;
+        }
+
+        if (RegCloseKey(key) != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        return keys;
+    }
+
+    std::optional<std::vector<std::string>> get_all_registry_values(const HKEY root, const char* path)
+    {
+        HKEY key{};
+        if (RegOpenKeyExA(root, path, 0, KEY_READ | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE, &key) != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        std::vector<std::string> values;
+        std::vector<char> name_buffer(MAX_PATH + 1);
+
+        for (DWORD i = 0;; ++i)
+        {
+            auto name_buffer_len = static_cast<DWORD>(name_buffer.size());
+            const auto status = RegEnumValueA(key, i, name_buffer.data(), &name_buffer_len, nullptr, nullptr, nullptr, nullptr);
+            if (status == ERROR_SUCCESS)
+            {
+                values.emplace_back(name_buffer.data(), name_buffer_len);
+            }
+            else if (status == ERROR_NO_MORE_ITEMS)
+            {
+                break;
+            }
+            else
+            {
+                values.clear();
+                break;
+            }
+        }
+
+        if (values.empty())
+        {
+            RegCloseKey(key);
+            return std::nullopt;
+        }
+
+        if (RegCloseKey(key) != ERROR_SUCCESS)
+        {
+            return std::nullopt;
+        }
+
+        return values;
+    }
+
+    bool test_registry()
+    {
+#ifdef _WIN64
+        const std::string_view progDir = "C:\\Program Files";
+#else
+        const std::string_view progDir = "C:\\Program Files (x86)";
+#endif
+
+        // Basic Reading Test
+        const auto prog_files_dir =
+            read_registry_string(HKEY_LOCAL_MACHINE, R"(SOFTWARE\Microsoft\Windows\CurrentVersion)", "ProgramFilesDir");
+        if (!prog_files_dir || *prog_files_dir != progDir)
+        {
+            return false;
+        }
+
+        // WOW64 Redirection Test
+        const auto pst_display = read_registry_string(
+            HKEY_LOCAL_MACHINE, R"(SOFTWARE\WOW6432Node\Microsoft\Windows NT\CurrentVersion\Time Zones\Pacific Standard Time)", "Display");
+        if (!pst_display || pst_display->empty())
+        {
+            return false;
+        }
+
+        // Key Sub-keys Enumeration Test
+        const auto subkeys_opt = get_all_registry_keys(HKEY_LOCAL_MACHINE, R"(SOFTWARE\Microsoft\Windows NT\CurrentVersion)");
+        if (!subkeys_opt)
+        {
+            return false;
+        }
+
+        bool found_fonts = false;
+        for (const auto& key_name : *subkeys_opt)
+        {
+            if (key_name == "Fonts")
+            {
+                found_fonts = true;
+                break;
+            }
+        }
+
+        (void)found_fonts;
+#ifdef _WIN64
+        if (!found_fonts)
+        {
+            return false;
+        }
+#endif
+
+        // Key Values Enumeration Test
+        const auto values_opt = get_all_registry_values(HKEY_LOCAL_MACHINE, R"(SOFTWARE\Microsoft\Windows NT\CurrentVersion)");
+        if (!values_opt)
+        {
+            return false;
+        }
+
+        bool found_product_name = false;
+        for (const auto& val_name : *values_opt)
+        {
+            if (val_name == "ProductName")
+            {
+                found_product_name = true;
+                break;
+            }
+        }
+        if (!found_product_name)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_system_info()
+    {
+        std::array<char, MAX_PATH> sys_dir{};
+        if (GetSystemDirectoryA(sys_dir.data(), static_cast<DWORD>(sys_dir.size())) == 0)
+        {
+            return false;
+        }
+        if (strlen(sys_dir.data()) != 19)
+        {
+            return false;
+        }
+
+        // TODO: This currently doesn't work.
+        /*
+        char username[256];
+        DWORD username_len = sizeof(username);
+        if (!GetUserNameA(username, &username_len))
+        {
+            return false;
+        }
+        if (username_len <= 1)
+        {
+            return false;
+        }
+        */
+
+        return true;
+    }
+
+    bool validate_primary_monitor(MONITORINFOEXA& mi)
+    {
+        if (std::string_view(mi.szDevice) != R"(\\.\DISPLAY1)")
+        {
+            return false;
+        }
+
+        if (mi.rcMonitor.left != 0 || mi.rcMonitor.top != 0 || mi.rcMonitor.right != 1920 || mi.rcMonitor.bottom != 1080)
+        {
+            return false;
+        }
+
+        if (!(mi.dwFlags & MONITORINFOF_PRIMARY))
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_monitor_info()
+    {
+        const POINT pt = {0, 0};
+        auto* const hMonitor = MonitorFromPoint(pt, MONITOR_DEFAULTTOPRIMARY);
+        if (!hMonitor)
+        {
+            return false;
+        }
+
+        MONITORINFOEXA mi;
+        mi.cbSize = sizeof(mi);
+
+        if (!GetMonitorInfoA(hMonitor, &mi))
+        {
+            return false;
+        }
+
+        return validate_primary_monitor(mi);
+    }
+
+    BOOL CALLBACK monitor_enum_proc(HMONITOR hMonitor, HDC, LPRECT, LPARAM dwData)
+    {
+        auto* valid = reinterpret_cast<bool*>(dwData);
+
+        MONITORINFOEXA mi;
+        mi.cbSize = sizeof(mi);
+
+        if (!GetMonitorInfoA(hMonitor, &mi))
+        {
+            return FALSE;
+        }
+
+        *valid = validate_primary_monitor(mi);
+
+        return *valid ? TRUE : FALSE;
+    }
+
+    bool test_user_callback()
+    {
+        bool valid = false;
+        if (!EnumDisplayMonitors(nullptr, nullptr, monitor_enum_proc, reinterpret_cast<LPARAM>(&valid)))
+        {
+            return false;
+        }
+
+        return valid;
+    }
+
+    bool test_time_zone()
+    {
+        DYNAMIC_TIME_ZONE_INFORMATION current_dtzi = {};
+        DWORD result = GetDynamicTimeZoneInformation(&current_dtzi);
+
+        if (result == TIME_ZONE_ID_INVALID)
+        {
+            return false;
+        }
+
+        if (current_dtzi.Bias != -60 || current_dtzi.StandardBias != 0 || current_dtzi.DaylightBias != -60 ||
+            current_dtzi.DynamicDaylightTimeDisabled != FALSE)
+        {
+            return false;
+        }
+
+        if (wcscmp(current_dtzi.StandardName, L"W. Europe Standard Time") != 0 ||
+            wcscmp(current_dtzi.DaylightName, L"W. Europe Daylight Time") != 0 ||
+            wcscmp(current_dtzi.TimeZoneKeyName, L"W. Europe Standard Time") != 0)
+        {
+            return false;
+        }
+
+        if (current_dtzi.StandardDate.wYear != 0 || current_dtzi.StandardDate.wMonth != 10 || current_dtzi.StandardDate.wDayOfWeek != 0 ||
+            current_dtzi.StandardDate.wDay != 5 || current_dtzi.StandardDate.wHour != 3 || current_dtzi.StandardDate.wMinute != 0 ||
+            current_dtzi.StandardDate.wSecond != 0 || current_dtzi.StandardDate.wMilliseconds != 0)
+        {
+            return false;
+        }
+
+        if (current_dtzi.DaylightDate.wYear != 0 || current_dtzi.DaylightDate.wMonth != 3 || current_dtzi.DaylightDate.wDayOfWeek != 0 ||
+            current_dtzi.DaylightDate.wDay != 5 || current_dtzi.DaylightDate.wHour != 2 || current_dtzi.DaylightDate.wMinute != 0 ||
+            current_dtzi.DaylightDate.wSecond != 0 || current_dtzi.DaylightDate.wMilliseconds != 0)
+        {
+            return false;
+        }
+
+        return true;
+    }
+
+    void throw_exception()
+    {
+        if (do_the_task)
+        {
+            throw std::runtime_error("OK");
+        }
+    }
+
+    bool test_exceptions()
+    {
+        try
+        {
+            throw_exception();
+            return false;
+        }
+        catch (const std::exception& e)
+        {
+            return e.what() == std::string("OK");
+        }
+    }
+
+    struct wsa_initializer
+    {
+        wsa_initializer()
+        {
+            WSADATA wsa_data;
+            if (WSAStartup(MAKEWORD(2, 2), &wsa_data))
+            {
+                throw std::runtime_error("Unable to initialize WSA");
+            }
+        }
+
+        ~wsa_initializer()
+        {
+            WSACleanup();
+        }
+    };
+
+    bool test_dns()
+    {
+        wsa_initializer _{};
+        constexpr auto hostname = "google.com";
+
+        PDNS_RECORDA records = nullptr;
+        const auto query_status = DnsQuery_A(hostname, DNS_TYPE_A, DNS_QUERY_STANDARD, nullptr, &records, nullptr);
+        if (query_status != ERROR_SUCCESS)
+        {
+            printf("DnsQuery_A failed: %ld\n", query_status);
+            return false;
+        }
+
+        const auto free_records = sogen::utils::finally([&] {
+            if (records)
+            {
+                DnsRecordListFree(records, DnsFreeRecordList);
+            }
+        });
+
+        auto has_ipv4_record = false;
+        for (auto* current = records; current != nullptr; current = current->pNext)
+        {
+            if (current->wType == DNS_TYPE_A)
+            {
+                has_ipv4_record = true;
+                break;
+            }
+        }
+
+        if (!has_ipv4_record)
+        {
+            puts("DnsQuery_A returned no A records");
+            return false;
+        }
+
+        addrinfo hints{};
+        hints.ai_family = AF_UNSPEC;
+        hints.ai_socktype = SOCK_STREAM;
+        hints.ai_protocol = IPPROTO_TCP;
+
+        addrinfo* results = nullptr;
+        const auto resolve_status = getaddrinfo(hostname, "80", &hints, &results);
+        if (resolve_status != 0)
+        {
+            puts("getaddrinfo failed");
+            return false;
+        }
+
+        const auto free_results = sogen::utils::finally([&] {
+            if (results)
+            {
+                freeaddrinfo(results);
+            }
+        });
+
+        for (auto* current = results; current != nullptr; current = current->ai_next)
+        {
+            if (current->ai_family == AF_INET || current->ai_family == AF_INET6)
+            {
+                return true;
+            }
+        }
+
+        puts("getaddrinfo returned no usable addresses");
+        return false;
+    }
+
+    bool test_socket()
+    {
+        wsa_initializer _{};
+        constexpr std::string_view send_data = "Hello World";
+
+        const auto sender = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        const auto receiver = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sender == INVALID_SOCKET || receiver == INVALID_SOCKET)
+        {
+            puts("Socket creation failed");
+            return false;
+        }
+
+        sockaddr_in destination{};
+        destination.sin_family = AF_INET;
+        destination.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        destination.sin_port = htons(28970);
+
+        if (bind(receiver, reinterpret_cast<sockaddr*>(&destination), sizeof(destination)) == SOCKET_ERROR)
+        {
+            puts("Failed to bind socket!");
+            return false;
+        }
+
+        const auto sent_bytes = sendto(sender, send_data.data(), static_cast<int>(send_data.size()), 0,
+                                       reinterpret_cast<sockaddr*>(&destination), sizeof(destination));
+
+        if (static_cast<size_t>(sent_bytes) != send_data.size())
+        {
+            puts("Failed to send data!");
+            return false;
+        }
+
+        std::array<char, 100> buffer = {};
+        sockaddr_in sender_addr{};
+        int sender_length = sizeof(sender_addr);
+
+        const auto len = recvfrom(receiver, buffer.data(), static_cast<int>(buffer.size()), 0, reinterpret_cast<sockaddr*>(&sender_addr),
+                                  &sender_length);
+        const auto ulen = static_cast<size_t>(len);
+
+        if (ulen != send_data.size())
+        {
+            puts("Failed to receive data!");
+            return false;
+        }
+
+        return send_data == std::string_view(buffer.data(), ulen);
+    }
+
+#ifndef __MINGW64__
+    void throw_access_violation()
+    {
+        if (do_the_task)
+        {
+            *reinterpret_cast<int*>(1) = 1;
+        }
+    }
+
+    bool test_access_violation_exception()
+    {
+        __try
+        {
+            throw_access_violation();
+            return false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return GetExceptionCode() == STATUS_ACCESS_VIOLATION;
+        }
+    }
+
+    bool test_ud2_exception(void* address)
+    {
+        __try
+        {
+            reinterpret_cast<void (*)()>(address)();
+            return false;
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            return GetExceptionCode() == STATUS_ILLEGAL_INSTRUCTION;
+        }
+    }
+
+    bool test_unhandled_exception()
+    {
+        thread_local bool caught{};
+        caught = false;
+
+        auto* old = SetUnhandledExceptionFilter([](struct _EXCEPTION_POINTERS* info) -> LONG {
+            caught = true;
+
+#ifdef _WIN64
+            info->ContextRecord->Rip += 1;
+#else
+            info->ContextRecord->Eip += 1;
+#endif
+
+            return EXCEPTION_CONTINUE_EXECUTION;
+        });
+
+        DebugBreak();
+        SetUnhandledExceptionFilter(old);
+
+        return caught;
+    }
+
+    bool test_illegal_instruction_exception()
+    {
+        auto* const address = VirtualAlloc(nullptr, 0x1000, MEM_RESERVE | MEM_COMMIT, PAGE_EXECUTE_READWRITE);
+        if (!address)
+        {
+            return false;
+        }
+
+        memcpy(address, "\x0F\x0B", 2); // ud2
+
+        const auto res = test_ud2_exception(address);
+
+        VirtualFree(address, 0x1000, MEM_RELEASE);
+
+        return res;
+    }
+
+    INT32 test_guard_page_seh_filter(LPVOID address, DWORD code, struct _EXCEPTION_POINTERS* ep)
+    {
+        // We are only looking for guard page exceptions.
+        if (code != STATUS_GUARD_PAGE_VIOLATION)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // The number of defined elements in the ExceptionInformation array for
+        // a guard page violation should be 2.
+        if (ep->ExceptionRecord->NumberParameters != 2)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // The ExceptionInformation array specifies additional arguments that
+        // describe the exception.
+        auto* exception_information = ep->ExceptionRecord->ExceptionInformation;
+
+        // If this value is zero, the thread attempted to read the inaccessible
+        // data. If this value is 1, the thread attempted to write to an
+        // inaccessible address.
+        if (exception_information[0] != 1)
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // The second array element specifies the virtual address of the
+        // inaccessible data.
+        if (exception_information[1] != reinterpret_cast<ULONG_PTR>(address))
+        {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        return EXCEPTION_EXECUTE_HANDLER;
+    }
+
+    bool test_guard_page_exception()
+    {
+        SYSTEM_INFO sys_info;
+        GetSystemInfo(&sys_info);
+
+        // Allocate a guarded memory region with the length of the system page
+        // size.
+        auto* addr = static_cast<LPBYTE>(VirtualAlloc(nullptr, sys_info.dwPageSize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD));
+        if (addr == nullptr)
+        {
+            puts("Failed to allocate guard page");
+            return false;
+        }
+
+        bool success = false;
+
+        // We want to access some arbitrary offset into the guarded page, to
+        // ensure that ExceptionInformation correctly contains the virtual
+        // address of the inaccessible data, not the base address of the region.
+        constexpr size_t offset = 10;
+
+        // Trigger a guard page violation
+        __try
+        {
+            addr[offset] = 255;
+        }
+        // If the filter function returns EXCEPTION_CONTINUE_SEARCH, the
+        // exception contains all of the correct information.
+        __except (test_guard_page_seh_filter(addr + offset, GetExceptionCode(), GetExceptionInformation()))
+        {
+            success = true;
+        }
+
+        // The page guard should be lifted, so no exception should be raised.
+        __try
+        {
+            // The previous write should not have went through, this is probably
+            // superflous.
+            if (addr[offset] == 255)
+            {
+                success = false;
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER)
+        {
+            puts("Failed to read from page after guard exception!");
+            success = false;
+        }
+
+        // Free the allocated memory
+        if (!VirtualFree(addr, 0, MEM_RELEASE))
+        {
+            puts("Failed to free allocated region");
+            success = false;
+        }
+
+        return success;
+    }
+
+    bool test_native_exceptions()
+    {
+        return test_access_violation_exception()       //
+               && test_illegal_instruction_exception() //
+               && test_unhandled_exception()           //
+#ifdef _WIN64
+               && test_guard_page_exception();
+#else
+            ;
+#endif
+    }
+#endif
+
+    thread_local bool trap_flag_cleared = false;
+    constexpr DWORD TRAP_FLAG_MASK = 0x100;
+
+    LONG NTAPI single_step_handler(PEXCEPTION_POINTERS exception_info)
+    {
+        if (exception_info->ExceptionRecord->ExceptionCode == EXCEPTION_SINGLE_STEP)
+        {
+            PCONTEXT context = exception_info->ContextRecord;
+            trap_flag_cleared = (context->EFlags & TRAP_FLAG_MASK) == 0;
+            return EXCEPTION_CONTINUE_EXECUTION;
+        }
+
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+
+    bool test_interrupts()
+    {
+        trap_flag_cleared = false;
+
+        PVOID veh_handle = AddVectoredExceptionHandler(1, single_step_handler);
+        if (!veh_handle)
+        {
+            return false;
+        }
+
+        __writeeflags(__readeflags() | TRAP_FLAG_MASK);
+
+#ifdef __MINGW64__
+        asm("nop");
+#else
+        __nop();
+#endif
+
+        RemoveVectoredExceptionHandler(veh_handle);
+
+        return trap_flag_cleared;
+    }
+
+    void print_time()
+    {
+        const auto epoch_time = std::chrono::system_clock::now().time_since_epoch();
+        printf("Time: %" PRId64 "\n", std::chrono::duration_cast<std::chrono::nanoseconds>(epoch_time).count());
+    }
+
+    bool test_apis()
+    {
+        if (VirtualProtect(nullptr, 0, 0, nullptr))
+        {
+            return false;
+        }
+
+        std::array<wchar_t, 0x100> buffer{};
+        auto size = static_cast<DWORD>(buffer.size() / 2);
+        if (!GetComputerNameExW(ComputerNameNetBIOS, buffer.data(), &size))
+        {
+            return false;
+        }
+
+        PWSTR path{};
+        const auto hr = SHGetKnownFolderPath(FOLDERID_LocalAppData, 0, nullptr, &path);
+        if (FAILED(hr))
+        {
+            return false;
+        }
+
+        CoTaskMemFree(path);
+        return true;
+    }
+
+    bool test_apc()
+    {
+        int executions = 0;
+
+        PAPCFUNC apc_func = [](const ULONG_PTR param) {
+            *reinterpret_cast<int*>(param) += 1; //
+        };
+
+        QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&executions));
+        QueueUserAPC(apc_func, GetCurrentThread(), reinterpret_cast<ULONG_PTR>(&executions));
+
+        Sleep(1);
+
+        if (executions != 0)
+        {
+            return false;
+        }
+
+        SleepEx(1, TRUE);
+        return executions == 2;
+    }
+
+    bool test_window_geometry()
+    {
+        WNDCLASSEXA wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestWindowNonclientClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = DefWindowProcA;
+
+        if (!RegisterClassExA(&wc))
+        {
+            puts("Failed to register window class");
+            return false;
+        }
+
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
+        struct window_case
+        {
+            DWORD style;
+            DWORD ex_style;
+        };
+
+        constexpr std::array cases = {
+            window_case{.style = WS_POPUP | WS_THICKFRAME, .ex_style = 0},
+            window_case{.style = WS_POPUP | WS_CAPTION, .ex_style = 0},
+            window_case{.style = WS_POPUP | WS_DLGFRAME, .ex_style = 0},
+            window_case{.style = WS_POPUP, .ex_style = WS_EX_CLIENTEDGE},
+        };
+
+        for (const auto& test : cases)
+        {
+            constexpr LONG expected_client_height = 123;
+            constexpr LONG expected_client_width = 321;
+
+            RECT adjusted_rect{0, 0, expected_client_width, expected_client_height};
+            const BOOL adjusted = test.ex_style ? AdjustWindowRectEx(&adjusted_rect, test.style, FALSE, test.ex_style)
+                                                : AdjustWindowRect(&adjusted_rect, test.style, FALSE);
+            if (!adjusted)
+            {
+                puts("Failed to calculate nonclient insets");
+                return false;
+            }
+
+            const auto adjusted_width = adjusted_rect.right - adjusted_rect.left;
+            const auto adjusted_height = adjusted_rect.bottom - adjusted_rect.top;
+
+            const HWND hwnd = CreateWindowExA(test.ex_style, wc.lpszClassName, nullptr, test.style, 0, 0, adjusted_width, adjusted_height,
+                                              nullptr, nullptr, wc.hInstance, nullptr);
+            if (!hwnd)
+            {
+                puts("Failed to create test window");
+                return false;
+            }
+
+            const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
+
+            RECT window_rect{};
+            RECT client_rect{};
+            if (!GetWindowRect(hwnd, &window_rect) || !GetClientRect(hwnd, &client_rect))
+            {
+                return false;
+            }
+
+            const auto window_width = window_rect.right - window_rect.left;
+            const auto window_height = window_rect.bottom - window_rect.top;
+            const auto client_width = client_rect.right - client_rect.left;
+            const auto client_height = client_rect.bottom - client_rect.top;
+
+            if (window_width != adjusted_width || window_height != adjusted_height)
+            {
+                puts("Window size does not match AdjustWindowRect result");
+                return false;
+            }
+
+            if (client_width != expected_client_width || client_height != expected_client_height)
+            {
+                puts("AdjustWindowRect round-trip failed");
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool test_message_queue()
+    {
+        thread_local UINT wnd_proc_num = 0;
+        thread_local UINT destroy_count = 0;
+        static const UINT wnd_msg_id = WM_APP + 2;
+
+        WNDCLASSEXA wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestMsgQueueClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = [](HWND hwnd, UINT msg, WPARAM wp, LPARAM lp) -> LRESULT {
+            if (msg == WM_CREATE)
+            {
+                auto* const cs = reinterpret_cast<CREATESTRUCTA*>(lp);
+                if (cs->lpCreateParams == reinterpret_cast<void*>(0x1337))
+                {
+                    wnd_proc_num += 1;
+                }
+            }
+            else if (msg == wnd_msg_id)
+            {
+                if (wp == 123 && lp == 456)
+                {
+                    wnd_proc_num += 1;
+                    return 777;
+                }
+            }
+            else if (msg == WM_CLOSE)
+            {
+                wnd_proc_num += 1;
+                if (wnd_proc_num == 2)
+                {
+                    return 0;
+                }
+            }
+            else if (msg == WM_DESTROY)
+            {
+                ++destroy_count;
+                PostQuitMessage(42);
+            }
+            return DefWindowProcA(hwnd, msg, wp, lp);
+        };
+
+        if (!RegisterClassExA(&wc))
+        {
+            puts("Failed to register window class");
+            return false;
+        }
+
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
+        HWND hwnd = CreateWindowExA(0, wc.lpszClassName, nullptr, 0, 0, 0, 0, 0, HWND_MESSAGE, nullptr, wc.hInstance,
+                                    reinterpret_cast<void*>(0x1337));
+        if (!hwnd || wnd_proc_num != 1)
+        {
+            puts("Failed to create message window");
+            return false;
+        }
+
+        const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
+
+        const LRESULT send_res = SendMessageA(hwnd, wnd_msg_id, 123, 456);
+
+        if (send_res != 777 || wnd_proc_num != 2)
+        {
+            puts("SendMessage failed");
+            return false;
+        }
+
+        wnd_proc_num = 0;
+        if (!PostMessageA(hwnd, wnd_msg_id, 123, 456))
+        {
+            puts("PostMessage failed");
+            return false;
+        }
+
+        MSG msg = {};
+        if (GetMessageA(&msg, hwnd, 0, 0) <= 0)
+        {
+            puts("GetMessage failed or returned WM_QUIT unexpectedly");
+            return false;
+        }
+
+        if (msg.message != wnd_msg_id)
+        {
+            puts("Retrieved message is not the expected custom message");
+            return false;
+        }
+
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+
+        if (wnd_proc_num != 1)
+        {
+            puts("Posted window message did not execute WndProc");
+            return false;
+        }
+
+        SendMessageA(hwnd, WM_CLOSE, 0, 0);
+        if (!IsWindow(hwnd) || destroy_count != 0)
+        {
+            puts("WndProc unexpectedly destroyed the window on cancelled WM_CLOSE");
+            return false;
+        }
+
+        SendMessageA(hwnd, WM_CLOSE, 0, 0);
+        if (IsWindow(hwnd) || destroy_count != 1)
+        {
+            puts("DefWindowProc did not destroy the window on WM_CLOSE");
+            return false;
+        }
+        hwnd = nullptr;
+
+        const BOOL quit_result = GetMessageA(&msg, nullptr, 0, 0);
+        if (quit_result != 0)
+        {
+            puts("GetMessage did not return 0 for WM_QUIT");
+            return false;
+        }
+
+        if (msg.message != WM_QUIT)
+        {
+            puts("Message is not WM_QUIT");
+            return false;
+        }
+
+        if (msg.wParam != 42)
+        {
+            puts("WM_QUIT exit code mismatch");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_paint_message_queue()
+    {
+        struct paint_state
+        {
+            HWND window{};
+            int ncpaint{};
+            int erase{};
+            int paint{};
+        };
+
+        thread_local paint_state* active_paint_state{};
+
+        WNDCLASSEXA wc = {};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestPaintMsgQueueClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = [](const HWND hwnd, const UINT message, const WPARAM w_param, const LPARAM l_param) -> LRESULT {
+            if (active_paint_state && hwnd == active_paint_state->window)
+            {
+                if (message == WM_NCPAINT)
+                {
+                    ++active_paint_state->ncpaint;
+                }
+                else if (message == WM_ERASEBKGND)
+                {
+                    ++active_paint_state->erase;
+                    RECT client_rect{};
+                    GetClientRect(hwnd, &client_rect);
+                    FillRect(reinterpret_cast<HDC>(w_param), &client_rect, reinterpret_cast<HBRUSH>(COLOR_WINDOW + 1));
+                    return TRUE;
+                }
+                else if (message == WM_PAINT)
+                {
+                    ++active_paint_state->paint;
+                    PAINTSTRUCT paint{};
+                    BeginPaint(hwnd, &paint);
+                    EndPaint(hwnd, &paint);
+                    return 0;
+                }
+            }
+
+            return DefWindowProcA(hwnd, message, w_param, l_param);
+        };
+
+        if (!RegisterClassExA(&wc))
+        {
+            puts("Failed to register paint window class");
+            return false;
+        }
+
+        const auto unregister_class = sogen::utils::finally([&] { UnregisterClassA(wc.lpszClassName, wc.hInstance); });
+
+        const HWND hwnd =
+            CreateWindowExA(0, wc.lpszClassName, nullptr, WS_OVERLAPPEDWINDOW, 0, 0, 100, 100, nullptr, nullptr, wc.hInstance, nullptr);
+        if (!hwnd)
+        {
+            puts("Failed to create paint window");
+            return false;
+        }
+
+        const auto destroy_window = sogen::utils::finally([&] { DestroyWindow(hwnd); });
+
+        paint_state state{.window = hwnd};
+        active_paint_state = &state;
+        const auto clear_paint_state = sogen::utils::finally([&] { active_paint_state = nullptr; });
+
+        ShowWindow(hwnd, SW_SHOWDEFAULT);
+
+        RECT update_rect{};
+        if (state.ncpaint != 1 || state.erase != 1)
+        {
+            puts("ShowWindow did not synthesize nonclient and background paint");
+            return false;
+        }
+        if (state.paint != 0 || !GetUpdateRect(hwnd, &update_rect, FALSE))
+        {
+            puts("ShowWindow background paint unexpectedly validated the window");
+            return false;
+        }
+        if (!UpdateWindow(hwnd) || state.paint != 1 || GetUpdateRect(hwnd, &update_rect, FALSE))
+        {
+            puts("UpdateWindow did not paint and validate the window after ShowWindow");
+            return false;
+        }
+
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_NOINTERNALPAINT | RDW_VALIDATE);
+        ValidateRect(hwnd, nullptr);
+
+        MSG msg = {};
+        while (PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_REMOVE))
+        {
+            ValidateRect(hwnd, nullptr);
+        }
+
+        if (!RedrawWindow(hwnd, nullptr, nullptr, RDW_INTERNALPAINT))
+        {
+            puts("Failed to request internal paint");
+            return false;
+        }
+
+        if (!PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_NOREMOVE))
+        {
+            puts("Internal WM_PAINT was not available");
+            return false;
+        }
+
+        if (PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_NOREMOVE))
+        {
+            puts("PM_NOREMOVE did not consume internal WM_PAINT");
+            return false;
+        }
+
+        InvalidateRect(hwnd, nullptr, FALSE);
+        RedrawWindow(hwnd, nullptr, nullptr, RDW_INTERNALPAINT);
+
+        if (!PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_REMOVE))
+        {
+            puts("Combined WM_PAINT was not available");
+            return false;
+        }
+
+        if (!PeekMessageA(&msg, hwnd, WM_PAINT, WM_PAINT, PM_NOREMOVE))
+        {
+            puts("PM_REMOVE consumed the invalid update region");
+            return false;
+        }
+
+        ValidateRect(hwnd, nullptr);
+
+        return true;
+    }
+
+    bool test_mutable_callbacks()
+    {
+        struct test_state
+        {
+            int changing_count{};
+            int size_width{};
+            int size_height{};
+            UINT changed_flags{};
+            bool mutate{true};
+            bool saw_size{};
+            bool saw_changed{};
+        };
+
+        thread_local test_state* active_state{};
+        test_state state{};
+        active_state = &state;
+
+        WNDCLASSEXA wc{};
+        wc.cbSize = sizeof(wc);
+        wc.lpszClassName = "TestMutMsgQueueClass";
+        wc.hInstance = GetModuleHandleA(nullptr);
+        wc.lpfnWndProc = [](HWND hwnd, const UINT msg, const WPARAM wp, const LPARAM lp) -> LRESULT {
+            if (active_state && msg == WM_WINDOWPOSCHANGING && active_state->mutate)
+            {
+                auto& position = *reinterpret_cast<WINDOWPOS*>(lp);
+                position.x = -123;
+                position.y = -456;
+                position.cx = 800;
+                position.cy = 600;
+                position.flags &= ~(SWP_NOMOVE | SWP_NOSIZE);
+                ++active_state->changing_count;
+            }
+            else if (active_state && msg == WM_WINDOWPOSCHANGED)
+            {
+                active_state->changed_flags = reinterpret_cast<const WINDOWPOS*>(lp)->flags;
+                active_state->saw_changed = true;
+            }
+            else if (active_state && msg == WM_SIZE)
+            {
+                active_state->size_width = LOWORD(lp);
+                active_state->size_height = HIWORD(lp);
+                active_state->saw_size = true;
+            }
+
+            return DefWindowProcA(hwnd, msg, wp, lp);
+        };
+
+        if (!RegisterClassExA(&wc))
+        {
+            active_state = nullptr;
+            return false;
+        }
+
+        HWND hwnd{};
+        const auto cleanup = sogen::utils::finally([&] {
+            state.mutate = false;
+            if (hwnd)
+            {
+                DestroyWindow(hwnd);
+            }
+            UnregisterClassA(wc.lpszClassName, wc.hInstance);
+            active_state = nullptr;
+        });
+
+        hwnd = CreateWindowExA(0, wc.lpszClassName, nullptr, WS_OVERLAPPEDWINDOW | WS_VISIBLE, 10, 20, 320, 240, nullptr, nullptr,
+                               wc.hInstance, nullptr);
+        state.mutate = false;
+        if (!hwnd)
+        {
+            return false;
+        }
+
+        RECT window_rect{};
+        RECT client_rect{};
+        if (!GetWindowRect(hwnd, &window_rect) || !GetClientRect(hwnd, &client_rect))
+        {
+            return false;
+        }
+
+        const auto window_width = window_rect.right - window_rect.left;
+        const auto window_height = window_rect.bottom - window_rect.top;
+        const auto client_width = client_rect.right - client_rect.left;
+        const auto client_height = client_rect.bottom - client_rect.top;
+
+        return state.changing_count == 2 && state.saw_changed && (state.changed_flags & SWP_SHOWWINDOW) != 0 && state.saw_size &&
+               window_rect.left == -123 && window_rect.top == -456 && window_width == 800 && window_height == 600 &&
+               client_width < window_width && client_height < window_height && state.size_width == client_width &&
+               state.size_height == client_height;
+    }
+
+    bool test_private_namespace()
+    {
+        auto create_boundary_descriptor = [](const wchar_t* name) -> HANDLE {
+            auto* hBoundaryDescriptor = CreateBoundaryDescriptorW(name, 0);
+            if (hBoundaryDescriptor == nullptr)
+            {
+                puts("Failed to create boundary descriptor");
+                return nullptr;
+            }
+
+            PSID pLocalAdmin{};
+            if (ConvertStringSidToSidW(L"S-1-1-0", &pLocalAdmin) == FALSE)
+            {
+                puts("ConvertStringSidToSid failed");
+                return nullptr;
+            }
+
+            auto res = AddSIDToBoundaryDescriptor(&hBoundaryDescriptor, pLocalAdmin);
+            LocalFree(pLocalAdmin);
+
+            if (res == FALSE)
+            {
+                puts("AddSIDToBoundaryDescriptor failed");
+                return nullptr;
+            }
+
+            return hBoundaryDescriptor;
+        };
+
+        std::array<HANDLE, 2> boundary{};
+        std::array<HANDLE, 5> ns{};
+
+        const auto _ = sogen::utils::finally([&]() {
+            for (auto* elem : boundary)
+            {
+                if (elem)
+                {
+                    DeleteBoundaryDescriptor(elem);
+                }
+            }
+
+            for (auto* elem : ns)
+            {
+                if (elem)
+                {
+                    ClosePrivateNamespace(elem, 0);
+                }
+            }
+        });
+
+        boundary[0] = create_boundary_descriptor(L"boundary1");
+        if (boundary[0] == nullptr)
+        {
+            return false;
+        }
+
+        ns[0] = CreatePrivateNamespaceW(nullptr, boundary[0], L"ns");
+        if (ns[0] == nullptr)
+        {
+            puts("CreatePrivateNamespaceW failed");
+            return false;
+        }
+
+        ns[1] = CreatePrivateNamespaceW(nullptr, boundary[0], L"alt_ns");
+        if (ns[1] != nullptr)
+        {
+            puts("CreatePrivateNamespaceW did not refuse to associate another prefix with existing namespace");
+            return false;
+        }
+
+        if (GetLastError() != ERROR_ALREADY_EXISTS)
+        {
+            puts("GetLastError did not return ERROR_ALREADY_EXISTS");
+            return false;
+        }
+
+        boundary[1] = create_boundary_descriptor(L"boundary2");
+        if (boundary[1] == nullptr)
+        {
+            return false;
+        }
+
+        ns[2] = CreatePrivateNamespaceW(nullptr, boundary[1], L"ns");
+        if (ns[2] != nullptr)
+        {
+            puts("CreatePrivateNamespaceW did not refuse to create another namespace associated with existing prefix");
+            return false;
+        }
+
+        if (GetLastError() != ERROR_DUP_NAME)
+        {
+            puts("GetLastError did not return ERROR_DUP_NAME");
+            return false;
+        }
+
+        auto* mutex = CreateMutexW(nullptr, FALSE, L"ns\\mutex");
+        if (mutex == nullptr)
+        {
+            puts("CreateMutex failed to create mutex in private namespace");
+            return false;
+        }
+
+        CloseHandle(mutex);
+
+        ns[3] = OpenPrivateNamespaceW(boundary[0], L"alt_ns");
+        if (ns[3] == nullptr)
+        {
+            puts("OpenPrivateNamespaceW failed to open existing namespace and associate it with different prefix");
+            return false;
+        }
+
+        ns[4] = OpenPrivateNamespaceW(boundary[0], L"ns");
+        if (ns[4])
+        {
+            puts("OpenPrivateNamespaceW did not refuse to open existing namespace and associate it with existing prefix");
+            return false;
+        }
+
+        DeleteBoundaryDescriptor(boundary[0]);
+        boundary[0] = nullptr;
+
+        if (!ClosePrivateNamespace(ns[3], 0))
+        {
+            puts("ClosePrivateNamespace failed");
+            return false;
+        }
+
+        ns[3] = nullptr;
+
+        if (!ClosePrivateNamespace(ns[0], PRIVATE_NAMESPACE_FLAG_DESTROY))
+        {
+            puts("ClosePrivateNamespace (with destroy flag) failed");
+            return false;
+        }
+
+        ns[0] = nullptr;
+
+        return true;
+    }
+
+    bool test_actctx()
+    {
+        ACTCTXA actctx{};
+        actctx.cbSize = sizeof(actctx);
+        actctx.dwFlags = ACTCTX_FLAG_HMODULE_VALID | ACTCTX_FLAG_RESOURCE_NAME_VALID;
+        actctx.hModule = GetModuleHandleW(nullptr);
+        actctx.lpResourceName = CREATEPROCESS_MANIFEST_RESOURCE_ID;
+
+        auto* ctx = CreateActCtxA(&actctx);
+        if (ctx == INVALID_HANDLE_VALUE)
+        {
+            return false;
+        }
+
+        ReleaseActCtx(ctx);
+        return true;
+    }
+
+    bool test_mmio()
+    {
+        const auto t0 = timeGetTime();
+
+        // waste a bit of time
+        auto dummy = std::thread([] {
+            for (int i = 0; i < 1024; i++)
+            {
+                std::this_thread::yield();
+            }
+        });
+        dummy.join();
+
+        const auto t1 = timeGetTime();
+
+        return t1 != t0;
+    }
+
+    bool test_settimer()
+    {
+        MSG msg = {};
+        while (PeekMessageA(&msg, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE))
+        {
+        }
+
+        HANDLE dummy_event = CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        if (!dummy_event)
+        {
+            puts("CreateEventW failed");
+            return false;
+        }
+
+        const auto cleanup_event = sogen::utils::finally([&] { CloseHandle(dummy_event); });
+
+        const UINT_PTR timer_id = SetTimer(nullptr, 0, 10, nullptr);
+        if (!timer_id)
+        {
+            puts("SetTimer failed");
+            return false;
+        }
+
+        const auto cleanup_timer = sogen::utils::finally([&] { KillTimer(nullptr, timer_id); });
+
+        const DWORD wait_result = MsgWaitForMultipleObjects(1, &dummy_event, FALSE, 1000, QS_TIMER);
+
+        if (wait_result != WAIT_OBJECT_0 + 1)
+        {
+            printf("MsgWaitForMultipleObjects returned unexpected result: %lu\n", wait_result);
+            return false;
+        }
+
+        if (!PeekMessageA(&msg, nullptr, WM_TIMER, WM_TIMER, PM_REMOVE))
+        {
+            puts("Expected WM_TIMER message was not available");
+            return false;
+        }
+
+        if (msg.message != WM_TIMER)
+        {
+            puts("Received message was not WM_TIMER");
+            return false;
+        }
+
+        if (msg.hwnd != nullptr)
+        {
+            puts("Expected a thread timer, but WM_TIMER had a window handle");
+            return false;
+        }
+
+        if (msg.wParam != timer_id)
+        {
+            puts("WM_TIMER timer id mismatch");
+            return false;
+        }
+
+        return true;
+    }
+
+    bool test_handle_tag_bits()
+    {
+        using nt_close_t = LONG(NTAPI*)(HANDLE);
+        const auto nt_close =
+            reinterpret_cast<nt_close_t>(reinterpret_cast<void*>(GetProcAddress(GetModuleHandleA("ntdll.dll"), "NtClose")));
+        if (!nt_close)
+        {
+            puts("ntdll!NtClose not found");
+            return false;
+        }
+
+        const auto open_file = [](const char* path) {
+            return CreateFileA(path, GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        };
+
+        const auto is_open = [](const HANDLE file) {
+            char byte{};
+            DWORD read{};
+            return ReadFile(file, &byte, sizeof(byte), &read, nullptr) != FALSE;
+        };
+
+        bool valid = true;
+
+        for (uint32_t tag = 0; tag < 4; ++tag)
+        {
+            const HANDLE before = open_file(R"(C:\Windows\System32\ntdll.dll)");
+            const HANDLE target = open_file(R"(C:\Windows\System32\kernel32.dll)");
+            const HANDLE after = open_file(R"(C:\Windows\System32\kernelbase.dll)");
+
+            if (before == INVALID_HANDLE_VALUE || target == INVALID_HANDLE_VALUE || after == INVALID_HANDLE_VALUE)
+            {
+                puts("Failed to open the probe files");
+                return false;
+            }
+
+            auto* const tagged = reinterpret_cast<HANDLE>((reinterpret_cast<ULONG_PTR>(target) & ~ULONG_PTR{3}) | tag);
+            const auto status = nt_close(tagged);
+
+            if (status != 0 || !is_open(before) || is_open(target) || !is_open(after))
+            {
+                printf("NtClose(%p) with tag %u did not close exactly %p (status 0x%08lX)\n", tagged, tag, target, status);
+                valid = false;
+                CloseHandle(target);
+            }
+
+            CloseHandle(before);
+            CloseHandle(after);
+        }
+
+        return valid;
+    }
+
+    bool test_gdi()
+    {
+        const wchar_t* cursor_path = L"C:\\Windows\\Cursors\\aero_arrow.cur";
+
+        const auto attrs = GetFileAttributesW(cursor_path);
+        if (attrs == INVALID_FILE_ATTRIBUTES)
+        {
+            puts("aero_arrow.cur does not exist");
+            return false;
+        }
+
+        if ((attrs & FILE_ATTRIBUTE_DIRECTORY) != 0)
+        {
+            puts("aero_arrow.cur is not a file");
+            return false;
+        }
+
+        const HCURSOR cursor = LoadCursorFromFileW(cursor_path);
+        if (!cursor)
+        {
+            puts("LoadCursorFromFileW failed to load aero_arrow.cur");
+            return false;
+        }
+
+        DestroyCursor(cursor);
+        return true;
+    }
+
+    bool test_bcrypt_hash()
+    {
+        struct hash_vector
+        {
+            const wchar_t* algorithm;
+            std::vector<UCHAR> digest;
+        };
+
+        const std::array<hash_vector, 2> vectors{{
+            {.algorithm = BCRYPT_MD5_ALGORITHM,
+             .digest = {0x90, 0x01, 0x50, 0x98, 0x3c, 0xd2, 0x4f, 0xb0, 0xd6, 0x96, 0x3f, 0x7d, 0x28, 0xe1, 0x7f, 0x72}},
+            {.algorithm = BCRYPT_SHA256_ALGORITHM,
+             .digest = {0xba, 0x78, 0x16, 0xbf, 0x8f, 0x01, 0xcf, 0xea, 0x41, 0x41, 0x40, 0xde, 0x5d, 0xae, 0x22, 0x23,
+                        0xb0, 0x03, 0x61, 0xa3, 0x96, 0x17, 0x7a, 0x9c, 0xb4, 0x10, 0xff, 0x61, 0xf2, 0x00, 0x15, 0xad}},
+        }};
+
+        std::array<UCHAR, 3> input{'a', 'b', 'c'};
+
+        for (const auto& vector : vectors)
+        {
+            BCRYPT_ALG_HANDLE algorithm{};
+            const auto open_status = BCryptOpenAlgorithmProvider(&algorithm, vector.algorithm, nullptr, 0);
+            if (!BCRYPT_SUCCESS(open_status))
+            {
+                printf("BCryptOpenAlgorithmProvider(%ls) failed: 0x%08lX\n", vector.algorithm, open_status);
+                return false;
+            }
+
+            const auto close_algorithm = sogen::utils::finally([&] { BCryptCloseAlgorithmProvider(algorithm, 0); });
+
+            std::vector<UCHAR> digest(vector.digest.size());
+            const auto hash_status = BCryptHash(algorithm, nullptr, 0, input.data(), static_cast<ULONG>(input.size()), digest.data(),
+                                                static_cast<ULONG>(digest.size()));
+            if (!BCRYPT_SUCCESS(hash_status) || digest != vector.digest)
+            {
+                printf("BCryptHash(%ls) failed: 0x%08lX\n", vector.algorithm, hash_status);
+                return false;
+            }
+        }
+
+        return true;
+    }
+}
+
+#define RUN_TEST(func, name)                 \
+    {                                        \
+        printf("Running test '" name "': "); \
+        const auto res = func();             \
+        valid &= res;                        \
+        puts(res ? "Success" : "Fail");      \
+    }
+
+int main(const int argc, const char* argv[])
+{
+    if (argc == 2 && argv[1] == "-time"sv)
+    {
+        print_time();
+        return 0;
+    }
+
+    if (argc == 2 && argv[1] == "-fail-fast"sv)
+    {
+        EXCEPTION_RECORD record{};
+        record.ExceptionCode = 0xE0001234;
+        RaiseFailFastException(&record, nullptr, 0);
+    }
+
+    bool valid = true;
+
+#ifdef _WIN64
+    RUN_TEST(test_dns, "DNS")
+#endif
+    RUN_TEST(test_io, "I/O")
+    RUN_TEST(test_file_locking, "File Locking")
+    RUN_TEST(test_dir_io, "Dir I/O")
+    RUN_TEST(test_apis, "APIs")
+#ifdef _WIN64
+    RUN_TEST(test_working_directory, "Working Directory")
+#endif
+    RUN_TEST(test_registry, "Registry")
+    RUN_TEST(test_system_info, "System Info")
+    RUN_TEST(test_monitor_info, "Monitor Info")
+    RUN_TEST(test_time_zone, "Time Zone")
+    RUN_TEST(test_threads, "Threads")
+    RUN_TEST(test_threads_winapi, "Threads WinAPI")
+    RUN_TEST(test_env, "Environment")
+    RUN_TEST(test_lookup_account_sid, "LSA")
+    RUN_TEST(test_exceptions, "Exceptions")
+#ifndef __MINGW64__
+    RUN_TEST(test_native_exceptions, "Native Exceptions")
+#endif
+    if (!getenv("EMULATOR_ICICLE"))
+    {
+        RUN_TEST(test_interrupts, "Interrupts")
+    }
+    RUN_TEST(test_tls, "TLS")
+    RUN_TEST(test_socket, "Socket")
+    RUN_TEST(test_apc, "APC")
+    RUN_TEST(test_window_geometry, "Window Geometry")
+    RUN_TEST(test_user_callback, "User Callback")
+    RUN_TEST(test_mutable_callbacks, "Mutable User Callback")
+    RUN_TEST(test_message_queue, "Message Queue (General)")
+    RUN_TEST(test_paint_message_queue, "Message Queue (Paint)")
+    RUN_TEST(test_settimer, "User Timer")
+    RUN_TEST(test_private_namespace, "Private Namespace")
+    RUN_TEST(test_handle_tag_bits, "Handle Tag Bits")
+    RUN_TEST(test_actctx, "Activation Context")
+    RUN_TEST(test_mmio, "MMIO")
+    RUN_TEST(test_gdi, "GDI")
+    RUN_TEST(test_bcrypt_hash, "BCrypt Hash")
+
+    return valid ? 0 : 1;
+}

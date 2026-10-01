@@ -1,0 +1,736 @@
+#define ICICLE_EMULATOR_IMPL
+#include "icicle_x86_64_emulator.hpp"
+
+#include <cstdio>
+#include <unordered_set>
+#include <utils/object.hpp>
+#include <utils/finally.hpp>
+
+using icicle_emulator = struct icicle_emulator_;
+
+extern "C"
+{
+    using icicle_mmio_read_func = void(void* user, uint64_t address, void* data, size_t length);
+    using icicle_mmio_write_func = void(void* user, uint64_t address, const void* data, size_t length);
+
+    using raw_func = void(void*);
+    using ptr_func = void(void*, uint64_t);
+    using block_func = void(void*, uint64_t, uint64_t);
+    using interrupt_func = void(void*, int32_t);
+    using violation_func = int32_t(void*, uint64_t address, uint8_t operation, int32_t unmapped);
+    using data_accessor_func = void(void* user, const void* data, size_t length);
+    using memory_access_func = icicle_mmio_write_func;
+
+    struct icicle_stop_info
+    {
+        uint32_t kind;
+        uint32_t code;
+        uint64_t value;
+    };
+
+    icicle_emulator* icicle_create_emulator();
+    int32_t icicle_protect_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
+    int32_t icicle_map_memory(icicle_emulator*, uint64_t address, uint64_t length, uint8_t permissions);
+    int32_t icicle_map_mmio(icicle_emulator*, uint64_t address, uint64_t length, icicle_mmio_read_func* read_callback, void* read_data,
+                            icicle_mmio_write_func* write_callback, void* write_data);
+    int32_t icicle_unmap_memory(icicle_emulator*, uint64_t address, uint64_t length);
+    int32_t icicle_read_memory(icicle_emulator*, uint64_t address, void* data, size_t length);
+    int32_t icicle_write_memory(icicle_emulator*, uint64_t address, const void* data, size_t length);
+    void icicle_save_registers(icicle_emulator*, data_accessor_func* accessor, void* accessor_data);
+    void icicle_restore_registers(icicle_emulator*, const void* data, size_t length);
+    void icicle_reset_volatile_state(icicle_emulator*);
+    uint32_t icicle_create_snapshot(icicle_emulator*);
+    void icicle_restore_snapshot(icicle_emulator*, uint32_t id);
+    uint32_t icicle_add_syscall_hook(icicle_emulator*, raw_func* callback, void* data);
+    uint32_t icicle_add_interrupt_hook(icicle_emulator*, interrupt_func* callback, void* data);
+    uint32_t icicle_add_block_hook(icicle_emulator*, block_func* callback, void* data);
+    uint32_t icicle_add_execution_hook(icicle_emulator*, uint64_t address, ptr_func* callback, void* data);
+    uint32_t icicle_add_ranged_execution_hook(icicle_emulator*, uint64_t address, uint64_t size, ptr_func* callback, void* data);
+    uint32_t icicle_add_generic_execution_hook(icicle_emulator*, ptr_func* callback, void* data);
+    uint32_t icicle_add_violation_hook(icicle_emulator*, violation_func* callback, void* data);
+    uint32_t icicle_add_read_hook(icicle_emulator*, uint64_t start, uint64_t end, memory_access_func* cb, void* data);
+    uint32_t icicle_add_write_hook(icicle_emulator*, uint64_t start, uint64_t end, memory_access_func* cb, void* data);
+    void icicle_remove_hook(icicle_emulator*, uint32_t id);
+    size_t icicle_read_register(icicle_emulator*, int reg, void* data, size_t length);
+    size_t icicle_write_register(icicle_emulator*, int reg, const void* data, size_t length);
+    void icicle_start(icicle_emulator*, size_t count);
+    int32_t icicle_get_stop_info(icicle_emulator*, icicle_stop_info* info);
+    void icicle_stop(icicle_emulator*);
+    void icicle_destroy_emulator(icicle_emulator*);
+    void icicle_run_on_next_instruction(icicle_emulator*, raw_func* callback, void* data);
+}
+
+namespace sogen::icicle
+{
+    namespace
+    {
+        void ice(const bool result, const std::string_view error)
+        {
+            if (!result)
+            {
+                throw std::runtime_error(std::string(error));
+            }
+        }
+
+        template <typename T>
+        struct function_object : utils::object
+        {
+            bool* hook_state{};
+            std::function<T> func{};
+
+            function_object(std::function<T> f = {}, bool* state = nullptr)
+                : hook_state(state),
+                  func(std::move(f))
+            {
+            }
+
+            template <typename... Args>
+            auto operator()(Args&&... args) const
+            {
+                bool old_state{};
+                if (this->hook_state)
+                {
+                    old_state = *this->hook_state;
+                    *this->hook_state = true;
+                }
+
+                const auto _ = utils::finally([&] {
+                    if (this->hook_state)
+                    {
+                        *this->hook_state = old_state;
+                    }
+                });
+
+                return this->func.operator()(std::forward<Args>(args)...);
+            }
+
+            ~function_object() override = default;
+        };
+
+        template <typename T>
+        std::unique_ptr<function_object<T>> make_function_object(std::function<T> func, bool& hook_state)
+        {
+            return std::make_unique<function_object<T>>(std::move(func), &hook_state);
+        }
+
+        // memory_access_hook_callback with the leading cpu_interface& stripped: bind_cpu binds icicle's
+        // single vCPU into the callback (icicle is single-vCPU), so the stored callback takes no cpu.
+        using bound_memory_access_hook_callback = std::function<void(uint64_t address, const void* data, size_t size)>;
+
+        struct memory_access_hook
+        {
+            uint64_t address{};
+            uint64_t size{};
+            bound_memory_access_hook_callback callback{};
+            bool is_read{};
+        };
+
+        enum class icicle_stop_kind : uint32_t
+        {
+            none = 0,
+            instruction_limit = 1,
+            unhandled_exception = 2,
+            other = 3,
+        };
+    }
+
+    class icicle_x86_64_emulator : public x86_64_emulator
+    {
+      public:
+        icicle_x86_64_emulator()
+            : emu_(icicle_create_emulator())
+        {
+            if (!this->emu_)
+            {
+                throw std::runtime_error("Failed to create icicle emulator instance");
+            }
+        }
+
+        ~icicle_x86_64_emulator() override
+        {
+            reset_object_with_delayed_destruction(this->hooks_);
+            reset_object_with_delayed_destruction(this->storage_);
+            utils::reset_object_with_delayed_destruction(this->hooks_to_install_);
+
+            if (this->emu_)
+            {
+                icicle_destroy_emulator(this->emu_);
+                this->emu_ = nullptr;
+            }
+        }
+
+        void start(const size_t count) override
+        {
+            icicle_start(this->emu_, count);
+            this->throw_if_unhandled_stop();
+            this->perform_pending_actions();
+        }
+
+        void stop() override
+        {
+            icicle_stop(this->emu_);
+        }
+
+        void load_gdt(const pointer_type address, const uint32_t limit) override
+        {
+            struct gdtr
+            {
+                uint32_t padding{};
+                uint32_t limit{};
+                uint64_t address{};
+            };
+
+            const gdtr entry{.limit = limit, .address = address};
+            static_assert(sizeof(gdtr) - offsetof(gdtr, limit) == 12);
+
+            this->write_register(x86_register::gdtr, &entry.limit, 12);
+        }
+
+        void set_segment_base(const x86_register base, const pointer_type value) override
+        {
+            switch (base)
+            {
+            case x86_register::fs:
+            case x86_register::fs_base:
+                this->reg(x86_register::fs_base, value);
+                break;
+            case x86_register::gs:
+            case x86_register::gs_base:
+                this->reg(x86_register::gs_base, value);
+                break;
+            default:
+                break;
+            }
+        }
+
+        pointer_type get_segment_base(const x86_register base) override
+        {
+            switch (base)
+            {
+            case x86_register::fs:
+            case x86_register::fs_base:
+                return this->reg(x86_register::fs_base);
+            case x86_register::gs:
+            case x86_register::gs_base:
+                return this->reg(x86_register::gs_base);
+            default:
+                return 0;
+            }
+        }
+
+        size_t write_raw_register(const int reg, const void* value, const size_t size) override
+        {
+            return icicle_write_register(this->emu_, reg, value, size);
+        }
+
+        size_t read_raw_register(const int reg, void* value, const size_t size) override
+        {
+            return icicle_read_register(this->emu_, reg, value, size);
+        }
+
+        bool read_descriptor_table(const int reg, descriptor_table_register& table) override
+        {
+            if (reg != static_cast<int>(x86_register::gdtr) && reg != static_cast<int>(x86_register::idtr))
+            {
+                return false;
+            }
+
+            struct gdtr
+            {
+                uint32_t padding{};
+                uint32_t limit{};
+                uint64_t address{};
+            };
+
+            gdtr entry{};
+            static_assert(sizeof(gdtr) - offsetof(gdtr, limit) == 12);
+            this->read_register(x86_register::gdtr, &entry.limit, 12);
+
+            table.base = entry.address;
+            table.limit = entry.limit;
+            return true;
+        }
+
+        void map_mmio(const uint64_t address, const size_t size, mmio_read_callback read_cb, mmio_write_callback write_cb) override
+        {
+            struct mmio_wrapper : utils::object
+            {
+                uint64_t base{};
+                mmio_read_callback read_cb{};
+                mmio_write_callback write_cb{};
+            };
+
+            auto wrapper = std::make_unique<mmio_wrapper>();
+            wrapper->base = address;
+            wrapper->read_cb = std::move(read_cb);
+            wrapper->write_cb = std::move(write_cb);
+
+            auto* ptr = wrapper.get();
+            this->storage_.push_back(std::move(wrapper));
+
+            auto* read_wrapper = +[](void* user, const uint64_t addr, void* data, const size_t length) {
+                const auto* w = static_cast<mmio_wrapper*>(user);
+                w->read_cb(addr - w->base, data, length);
+            };
+
+            auto* write_wrapper = +[](void* user, const uint64_t addr, const void* data, const size_t length) {
+                const auto* w = static_cast<mmio_wrapper*>(user);
+                w->write_cb(addr + w->base, data, length);
+            };
+
+            icicle_map_mmio(this->emu_, address, size, read_wrapper, ptr, write_wrapper, ptr);
+        }
+
+        void map_memory(const uint64_t address, const size_t size, memory_permission permissions) override
+        {
+            const auto res = icicle_map_memory(this->emu_, address, size, static_cast<uint8_t>(permissions));
+            ice(res, "Failed to map memory");
+        }
+
+        void unmap_memory(const uint64_t address, const size_t size) override
+        {
+            const auto res = icicle_unmap_memory(this->emu_, address, size);
+            ice(res, "Failed to unmap memory");
+        }
+
+        bool try_read_memory(const uint64_t address, void* data, const size_t size) const override
+        {
+            return icicle_read_memory(this->emu_, address, data, size);
+        }
+
+        void read_memory(const uint64_t address, void* data, const size_t size) const override
+        {
+            const auto res = this->try_read_memory(address, data, size);
+            ice(res, "Failed to read memory");
+        }
+
+        bool try_write_memory(const uint64_t address, const void* data, const size_t size) override
+        {
+            return icicle_write_memory(this->emu_, address, data, size);
+        }
+
+        void write_memory(const uint64_t address, const void* data, const size_t size) override
+        {
+            const auto res = try_write_memory(address, data, size);
+            ice(res, "Failed to write memory");
+        }
+
+        void apply_memory_protection(const uint64_t address, const size_t size, memory_permission permissions) override
+        {
+            const auto res = icicle_protect_memory(this->emu_, address, size, static_cast<uint8_t>(permissions));
+            ice(res, "Failed to apply permissions");
+        }
+
+        // The raw icicle hook wrappers are captureless function pointers, so the
+        // triggering CPU is bound into the stored function up front.
+        template <typename Ret, typename... Args>
+        std::function<Ret(Args...)> bind_cpu(std::function<Ret(cpu_interface&, Args...)> callback)
+        {
+            return [this, c = std::move(callback)](Args... args) { return c(*this, std::forward<Args>(args)...); };
+        }
+
+        emulator_hook* hook_instruction(int instruction_type, instruction_hook_callback callback) override
+        {
+            if (static_cast<x86_hookable_instructions>(instruction_type) != x86_hookable_instructions::syscall)
+            {
+                // TODO
+                return nullptr;
+            }
+
+            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = obj.get();
+
+            const auto invoker = +[](void* cb) {
+                const auto& func = *static_cast<decltype(ptr)>(cb);
+                (void)func(0); //
+            };
+
+            const auto id = icicle_add_syscall_hook(this->emu_, invoker, ptr);
+            this->hooks_[id] = std::move(obj);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_basic_block(basic_block_hook_callback callback) override
+        {
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = object.get();
+            auto* wrapper = +[](void* user, const uint64_t addr, const uint64_t instructions) {
+                basic_block block{};
+                block.address = addr;
+                block.instruction_count = static_cast<size_t>(instructions);
+
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                (func)(block);
+            };
+
+            const auto id = icicle_add_block_hook(this->emu_, wrapper, ptr);
+            this->hooks_[id] = std::move(object);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_interrupt(interrupt_hook_callback callback) override
+        {
+            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = obj.get();
+            auto* wrapper = +[](void* user, const int32_t code) {
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                func(code);
+            };
+
+            const auto id = icicle_add_interrupt_hook(this->emu_, wrapper, ptr);
+            this->hooks_[id] = std::move(obj);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_memory_violation(memory_violation_hook_callback callback) override
+        {
+            auto obj = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = obj.get();
+            auto* wrapper = +[](void* user, const uint64_t address, const uint8_t operation, const int32_t unmapped) -> int32_t {
+                const auto violation_type = unmapped //
+                                                ? memory_violation_type::unmapped
+                                                : memory_violation_type::protection;
+
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                const auto res = func(address, 1, static_cast<memory_operation>(operation), violation_type);
+                const auto restart = res == memory_violation_continuation::restart;
+                const auto resume = res == memory_violation_continuation::resume || restart;
+                return resume ? 1 : 0;
+            };
+
+            const auto id = icicle_add_violation_hook(this->emu_, wrapper, ptr);
+            this->hooks_[id] = std::move(obj);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_memory_execution(const uint64_t address, memory_execution_hook_callback callback) override
+        {
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = object.get();
+            auto* wrapper = +[](void* user, const uint64_t addr) {
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                (func)(addr);
+            };
+
+            const auto id = icicle_add_execution_hook(this->emu_, address, wrapper, ptr);
+            this->hooks_[id] = std::move(object);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_memory_range_execution(const uint64_t address, const uint64_t size,
+                                                   memory_execution_hook_callback callback) override
+        {
+            if (size == 1)
+            {
+                return this->hook_memory_execution(address, std::move(callback));
+            }
+
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = object.get();
+            auto* wrapper = +[](void* user, const uint64_t addr) {
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                (func)(addr);
+            };
+
+            const auto id = icicle_add_ranged_execution_hook(this->emu_, address, size, wrapper, ptr);
+            this->hooks_[id] = std::move(object);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_memory_execution(memory_execution_hook_callback callback) override
+        {
+            auto object = make_function_object(this->bind_cpu(std::move(callback)), this->is_in_hook_);
+            auto* ptr = object.get();
+            auto* wrapper = +[](void* user, const uint64_t addr) {
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                (func)(addr);
+            };
+
+            const auto id = icicle_add_generic_execution_hook(this->emu_, wrapper, ptr);
+            this->hooks_[id] = std::move(object);
+
+            return wrap_hook(id);
+        }
+
+        emulator_hook* hook_memory_read(const uint64_t address, const uint64_t size, memory_access_hook_callback callback) override
+        {
+            return this->try_install_memory_access_hook(memory_access_hook{
+                .address = address,
+                .size = size,
+                .callback = this->bind_cpu(std::move(callback)),
+                .is_read = true,
+            });
+        }
+
+        emulator_hook* hook_memory_write(const uint64_t address, const uint64_t size, memory_access_hook_callback callback) override
+        {
+            return this->try_install_memory_access_hook(memory_access_hook{
+                .address = address,
+                .size = size,
+                .callback = this->bind_cpu(std::move(callback)),
+                .is_read = false,
+            });
+        }
+
+        void delete_hook(emulator_hook* hook) override
+        {
+            if (this->is_in_hook_)
+            {
+                this->hooks_to_delete_.insert(hook);
+            }
+            else
+            {
+                this->delete_hook_internal(hook);
+            }
+        }
+
+        void serialize_state(utils::buffer_serializer& buffer, const bool is_snapshot) const override
+        {
+            if (is_snapshot)
+            {
+                const auto snapshot = icicle_create_snapshot(this->emu_);
+                buffer.write<uint32_t>(snapshot);
+            }
+            else
+            {
+                buffer.write_vector(this->save_registers());
+            }
+        }
+
+        void deserialize_state(utils::buffer_deserializer& buffer, const bool is_snapshot) override
+        {
+            if (is_snapshot)
+            {
+                const auto snapshot = buffer.read<uint32_t>();
+                icicle_restore_snapshot(this->emu_, snapshot);
+            }
+            else
+            {
+                icicle_reset_volatile_state(this->emu_);
+                const auto data = buffer.read_vector<std::byte>();
+                this->restore_registers(data);
+            }
+        }
+
+        std::vector<std::byte> save_registers() const override
+        {
+            std::vector<std::byte> data{};
+            auto* accessor = +[](void* user, const void* data, const size_t length) {
+                auto& vec = *static_cast<std::vector<std::byte>*>(user);
+                vec.resize(length);
+                memcpy(vec.data(), data, length);
+            };
+
+            icicle_save_registers(this->emu_, accessor, &data);
+
+            return data;
+        }
+
+        void restore_registers(const std::vector<std::byte>& register_data) override
+        {
+            icicle_restore_registers(this->emu_, register_data.data(), register_data.size());
+        }
+
+        bool has_violation() const override
+        {
+            return false;
+        }
+
+        bool supports_instruction_counting() const override
+        {
+            return true;
+        }
+
+        bool is_stop_thread_safe() const override
+        {
+            return true;
+        }
+
+        bool supports_multiple_vcpus() const override
+        {
+            return false;
+        }
+
+        std::string get_name() const override
+        {
+            return "icicle-emu";
+        }
+
+      private:
+        bool is_in_hook_{false};
+        std::list<std::unique_ptr<utils::object>> storage_{};
+        std::unordered_map<uint32_t, std::unique_ptr<utils::object>> hooks_{};
+        std::unordered_map<emulator_hook*, std::optional<uint32_t>> id_mapping_{};
+        icicle_emulator* emu_{};
+        uint32_t index_{0};
+
+        std::unordered_set<emulator_hook*> hooks_to_delete_{};
+        std::unordered_map<emulator_hook*, memory_access_hook> hooks_to_install_{};
+
+        emulator_hook* wrap_hook(const std::optional<uint32_t> icicle_id)
+        {
+            const auto id = ++this->index_;
+            auto* hook = reinterpret_cast<emulator_hook*>(static_cast<size_t>(id));
+
+            this->id_mapping_[hook] = icicle_id;
+
+            return hook;
+        }
+
+        void throw_if_unhandled_stop()
+        {
+            icicle_stop_info info{};
+            ice(icicle_get_stop_info(this->emu_, &info) != 0, "Failed to read icicle stop info");
+
+            const auto kind = static_cast<icicle_stop_kind>(info.kind);
+            if (kind == icicle_stop_kind::none || kind == icicle_stop_kind::instruction_limit)
+            {
+                return;
+            }
+
+            std::array<char, 160> message{};
+            if (kind == icicle_stop_kind::unhandled_exception)
+            {
+                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled exception: code=0x%X value=0x%llX rip=0x%llX",
+                              info.code, static_cast<unsigned long long>(info.value),
+                              static_cast<unsigned long long>(this->read_instruction_pointer()));
+            }
+            else
+            {
+                std::snprintf(message.data(), message.size(), "Icicle stopped on unhandled VM exit at rip=0x%llX",
+                              static_cast<unsigned long long>(this->read_instruction_pointer()));
+            }
+
+            throw std::runtime_error(message.data());
+        }
+
+        emulator_hook* hook_memory_access(memory_access_hook hook, emulator_hook* hook_id)
+        {
+            auto obj = make_function_object(std::move(hook.callback), this->is_in_hook_);
+            auto* ptr = obj.get();
+            auto* wrapper = +[](void* user, const uint64_t address, const void* data, size_t length) {
+                const auto& func = *static_cast<decltype(ptr)>(user);
+                func(address, data, length);
+            };
+
+            auto* installer = hook.is_read ? &icicle_add_read_hook : &icicle_add_write_hook;
+            const auto id = installer(this->emu_, hook.address, hook.address + hook.size, wrapper, ptr);
+            this->hooks_[id] = std::move(obj);
+
+            if (hook_id)
+            {
+                this->id_mapping_[hook_id] = id;
+                return hook_id;
+            }
+
+            return wrap_hook(id);
+        }
+
+        void delete_hook_internal(emulator_hook* hook)
+        {
+            auto hook_id = this->id_mapping_.find(hook);
+            if (hook_id == this->id_mapping_.end())
+            {
+                return;
+            }
+
+            if (!hook_id->second.has_value())
+            {
+                this->hooks_to_delete_.insert(hook);
+                return;
+            }
+
+            const auto id = *hook_id->second;
+            this->id_mapping_.erase(hook_id);
+
+            const auto entry = this->hooks_.find(id);
+            if (entry == this->hooks_.end())
+            {
+                return;
+            }
+
+            icicle_remove_hook(this->emu_, id);
+            const auto obj = std::move(entry->second);
+            this->hooks_.erase(entry);
+            (void)obj;
+        }
+
+        void perform_pending_actions()
+        {
+            const auto hooks_to_delete = std::move(this->hooks_to_delete_);
+
+            this->hooks_to_delete_ = {};
+            this->perform_pending_hook_installs();
+
+            for (auto* hook : hooks_to_delete)
+            {
+                this->delete_hook_internal(hook);
+            }
+        }
+
+        void perform_pending_hook_installs()
+        {
+            auto hooks_to_install = std::move(this->hooks_to_install_);
+            this->hooks_to_install_ = {};
+
+            for (auto& hook : hooks_to_install)
+            {
+                this->hook_memory_access(std::move(hook.second), hook.first);
+            }
+        }
+
+        emulator_hook* try_install_memory_access_hook(memory_access_hook hook)
+        {
+            if (!this->is_in_hook_)
+            {
+                return this->hook_memory_access(std::move(hook), nullptr);
+            }
+
+            auto* hook_id = wrap_hook(std::nullopt);
+            this->hooks_to_install_[hook_id] = std::move(hook);
+
+            this->schedule_action_execution();
+
+            return hook_id;
+        }
+
+        void schedule_action_execution()
+        {
+            this->run_on_next_instruction([this] {
+                this->perform_pending_hook_installs(); //
+            });
+        }
+
+        void run_on_next_instruction(std::function<void()> func) const
+        {
+            auto* heap_func = new std::function(std::move(func));
+            auto* callback = +[](void* data) {
+                auto* cb = static_cast<std::function<void()>*>(data);
+
+                try
+                {
+                    (*cb)();
+                }
+                catch (...)
+                {
+                    // Ignore
+                }
+
+                delete cb;
+            };
+
+            icicle_run_on_next_instruction(this->emu_, callback, heap_func);
+        }
+    };
+
+    std::unique_ptr<x86_64_emulator> create_x86_64_emulator()
+    {
+        return std::make_unique<icicle_x86_64_emulator>();
+    }
+} // namespace sogen::icicle

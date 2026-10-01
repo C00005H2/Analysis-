@@ -1,0 +1,450 @@
+include_guard()
+
+##########################################
+
+set(PYTHON3_EXE "python3")
+if(CMAKE_SYSTEM_NAME MATCHES "Windows")
+  set(PYTHON3_EXE "python")
+endif()
+
+##########################################
+
+function(sogen_silence_deprecation_warnings)
+    set(CMAKE_WARN_DEPRECATED_OLD ${CMAKE_WARN_DEPRECATED} PARENT_SCOPE)
+    set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+endfunction()
+
+##########################################
+
+function(sogen_restore_deprecation_warnings)
+    set(CMAKE_WARN_DEPRECATED ${CMAKE_WARN_DEPRECATED_OLD} CACHE BOOL "" FORCE)
+endfunction()
+
+##########################################
+
+function(sogen_target_exclude_from_all target)
+  set_target_properties(${target} PROPERTIES EXCLUDE_FROM_ALL 1)
+  #set_target_properties(${target} PROPERTIES EXCLUDE_FROM_DEFAULT_BUILD 1)
+endfunction()
+
+##########################################
+
+function(sogen_targets_exclude_from_all)
+  foreach(target ${ARGV})
+    sogen_target_exclude_from_all(${target})
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_target_set_folder folder target)
+  #get_target_property(CURRENT_FOLDER ${target} FOLDER)
+  #if(NOT CURRENT_FOLDER)
+    set_target_properties(${target} PROPERTIES FOLDER "${folder}")
+  #endif()
+endfunction()
+
+##########################################
+
+function(sogen_targets_set_folder folder)
+  foreach(target ${ARGN})
+    sogen_target_set_folder(${folder} ${target})
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_target_disable_compile_commands target)
+  set_target_properties(${target} PROPERTIES EXPORT_COMPILE_COMMANDS OFF)
+endfunction()
+
+##########################################
+
+function(sogen_targets_disable_compile_commands)
+  foreach(target ${ARGV})
+    sogen_target_disable_compile_commands(${target})
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_target_expose_includes target)
+  get_target_property(target_type ${target} TYPE)
+  if("${target_type}" STREQUAL "UTILITY")
+    return()
+  endif()
+
+  get_target_property(TARGET_SOURCE_DIR ${target} SOURCE_DIR)
+  target_include_directories(${target} INTERFACE ${TARGET_SOURCE_DIR}/..)
+endfunction()
+
+##########################################
+
+function(sogen_targets_expose_includes)
+  foreach(target ${ARGV})
+  sogen_target_expose_includes(${target})
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_target_compile_options language target mode)
+  foreach(compile_option ${ARGN})
+    target_compile_options(${target} ${mode}
+      $<$<COMPILE_LANGUAGE:${language}>:${compile_option}>
+    )
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_target_c_and_cxx_compile_options)
+  sogen_target_compile_options(C ${ARGV})
+  sogen_target_compile_options(CXX ${ARGV})
+endfunction()
+
+##########################################
+
+macro(sogen_target_remove_compile_option target option)
+    get_target_property(target_flags ${target} COMPILE_OPTIONS)
+    if(target_flags)
+        list(REMOVE_ITEM target_flags ${option})
+        list(REMOVE_ITEM target_flags "$<$<COMPILE_LANGUAGE:C>:${option}>")
+        list(REMOVE_ITEM target_flags "$<$<COMPILE_LANGUAGE:CXX>:${option}>")
+        set_target_properties(${target} PROPERTIES COMPILE_OPTIONS "${target_flags}")
+    endif()
+
+    get_target_property(target_interface_flags ${target} INTERFACE_COMPILE_OPTIONS)
+    if(target_interface_flags)
+        list(REMOVE_ITEM target_interface_flags ${option})
+        list(REMOVE_ITEM target_interface_flags "$<$<COMPILE_LANGUAGE:C>:${option}>")
+        list(REMOVE_ITEM target_interface_flags "$<$<COMPILE_LANGUAGE:CXX>:${option}>")
+        set_target_properties(${target} PROPERTIES INTERFACE_COMPILE_OPTIONS "${target_interface_flags}")
+    endif()
+endmacro()
+
+##########################################
+
+macro(sogen_target_remove_compile_options target)
+  foreach(option ${ARGN})
+    sogen_target_remove_compile_option(${target} ${option})
+  endforeach()
+endmacro()
+
+##########################################
+
+function(sogen_targets_remove_compile_options targets)
+  foreach(target ${targets})
+    sogen_target_remove_compile_options(${target} ${ARGN})
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_add_compile_options language)
+  foreach(option ${ARGN})
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:${language}>:${option}>
+    )
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_add_release_compile_options language)
+  foreach(option ${ARGN})
+    add_compile_options(
+      $<$<COMPILE_LANGUAGE:${language}>:$<$<CONFIG:RELEASE>:${option}>>
+      $<$<COMPILE_LANGUAGE:${language}>:$<$<CONFIG:RELWITHDEBINFO>:${option}>>
+    )
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_add_release_link_options)
+  foreach(option ${ARGN})
+    add_link_options(
+      $<$<CONFIG:RELEASE>:${option}>
+      $<$<CONFIG:RELWITHDEBINFO>:${option}>
+    )
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_add_c_and_cxx_compile_options)
+  sogen_add_compile_options(C ${ARGV})
+  sogen_add_compile_options(CXX ${ARGV})
+endfunction()
+
+##########################################
+
+function(sogen_add_c_and_cxx_release_compile_options)
+  sogen_add_release_compile_options(C ${ARGV})
+  sogen_add_release_compile_options(CXX ${ARGV})
+endfunction()
+
+##########################################
+
+function(sogen_target_disable_warnings target)
+  get_target_property(target_type ${target} TYPE)
+  if(("${target_type}" STREQUAL "INTERFACE_LIBRARY") OR ("${target_type}" STREQUAL "UTILITY"))
+    return()
+  endif()
+
+  sogen_target_remove_compile_options(${target} /W3 -W3 /W4 -W4)
+
+  if(MSVC)
+    set(compile_options
+      /W0
+      /D_CRT_SECURE_NO_WARNINGS=1
+    )
+  else()
+    set(compile_options -w) # GCC/Clang: actually silence warnings for third-party / generated code
+  endif()
+
+  sogen_target_c_and_cxx_compile_options(${target} PRIVATE ${compile_options})
+
+  set_target_properties(${target} PROPERTIES SOGEN_WARNINGS_DISABLE ON)
+endfunction()
+
+##########################################
+
+function(sogen_targets_disable_warnings)
+  foreach(target ${ARGV})
+    sogen_target_disable_warnings(${target})
+  endforeach()
+endfunction()
+
+##########################################
+
+# MSVC extras for a generated-Steam-code target whose SDK headers the caller marks SYSTEM. C4743/C4744 are
+# MSVC's cross-TU -Wodr analogue (ISteam* types differ across snapshots) and fire at LTCG link.
+function(sogen_target_generated_code_warnings target)
+  if(MSVC)
+    target_compile_options(${target} PRIVATE /external:W0 /wd4743 /wd4744)
+    target_compile_definitions(${target} PRIVATE _CRT_SECURE_NO_WARNINGS=1)
+  endif()
+endfunction()
+
+##########################################
+
+function(sogen_target_set_warnings_as_errors target)
+  get_target_property(target_type ${target} TYPE)
+  if(("${target_type}" STREQUAL "INTERFACE_LIBRARY") OR ("${target_type}" STREQUAL "UTILITY"))
+    return()
+  endif()
+
+  get_target_property(warnings_disabled ${target} SOGEN_WARNINGS_DISABLE)
+  if(warnings_disabled)
+    return()
+  endif()
+
+  set(compile_options -Wall -Wextra
+   #-Wconversion
+   -pedantic -Werror -Wno-comment)
+
+  if(MSVC)
+    set(compile_options /W4 /WX)
+  endif()
+
+  target_compile_options(${target} PRIVATE
+    $<$<COMPILE_LANGUAGE:C>:$<$<CONFIG:RELEASE>:${compile_options}>>
+    $<$<COMPILE_LANGUAGE:CXX>:$<$<CONFIG:RELEASE>:${compile_options}>>
+    $<$<COMPILE_LANGUAGE:C>:$<$<CONFIG:RELWITHDEBINFO>:${compile_options}>>
+    $<$<COMPILE_LANGUAGE:CXX>:$<$<CONFIG:RELWITHDEBINFO>:${compile_options}>>
+  )
+endfunction()
+
+##########################################
+
+function(sogen_targets_set_warnings_as_errors)
+  foreach(target ${ARGV})
+    sogen_target_set_warnings_as_errors(${target})
+  endforeach()
+endfunction()
+
+##########################################
+
+function(sogen_get_all_targets var)
+    set(targets)
+    sogen_get_all_targets_recursive(targets ${CMAKE_CURRENT_SOURCE_DIR})
+    set(${var} ${targets} PARENT_SCOPE)
+endfunction()
+
+##########################################
+
+macro(sogen_get_all_targets_recursive targets dir)
+    get_property(subdirectories DIRECTORY ${dir} PROPERTY SUBDIRECTORIES)
+    foreach(subdir ${subdirectories})
+        sogen_get_all_targets_recursive(${targets} ${subdir})
+    endforeach()
+
+    get_property(current_targets DIRECTORY ${dir} PROPERTY BUILDSYSTEM_TARGETS)
+    list(APPEND ${targets} ${current_targets})
+endmacro()
+
+##########################################
+
+macro(sogen_list_difference list_a list_to_remove result)
+  set(${result} ${list_a})
+  list(REMOVE_ITEM ${result} ${list_to_remove})
+endmacro()
+
+##########################################
+
+macro(sogen_set_artifact_directory directory)
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${directory})
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_DEBUG ${directory})
+  set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_RELEASE ${directory})
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${directory})
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_DEBUG ${directory})
+  set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_RELEASE ${directory})
+  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY ${directory})
+  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_DEBUG ${directory})
+  set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_RELEASE ${directory})
+endmacro()
+
+##########################################
+
+macro(sogen_set_new_artifact_directory)
+  get_property(IS_MULTI_CONFIG GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+  if(IS_MULTI_CONFIG)
+      set(ARTIFACT_FOLDER_NAME "artifacts-$<LOWER_CASE:$<CONFIG>>")
+  else()
+      set(ARTIFACT_FOLDER_NAME "artifacts")
+  endif()
+
+  set(ARTIFACT_DIRECTORY "${CMAKE_BINARY_DIR}/${ARTIFACT_FOLDER_NAME}")
+  sogen_set_artifact_directory(${ARTIFACT_DIRECTORY})
+endmacro()
+
+##########################################
+
+macro(sogen_add_subdirectory_and_get_targets directory targets)
+  sogen_get_all_targets(EXISTING_TARGETS)
+  add_subdirectory(${directory})
+  sogen_get_all_targets(ALL_TARGETS)
+
+  sogen_list_difference("${ALL_TARGETS}" "${EXISTING_TARGETS}" ${targets})
+endmacro()
+
+##########################################
+
+macro(sogen_target_include_libraries target mode)
+  foreach(inc_target ${ARGN})
+    target_include_directories(${target} ${mode}
+      $<TARGET_PROPERTY:${inc_target},INTERFACE_INCLUDE_DIRECTORIES>
+      $<TARGET_PROPERTY:${inc_target},PUBLIC_INCLUDE_DIRECTORIES>
+    )
+  endforeach()
+endmacro()
+
+##########################################
+
+function(sogen_strip_target target)
+  # Keep symbols for builds whose whole point is debuggability: Debug, RelWithDebInfo, and any
+  # sanitizer build (stripping there yields unusable ASAN/UBSan stack traces).
+  if (CMAKE_BUILD_TYPE STREQUAL "Debug" OR CMAKE_BUILD_TYPE STREQUAL "RelWithDebInfo" OR SOGEN_ENABLE_SANITIZER)
+    return()
+  endif()
+
+  if(MSVC OR SOGEN_ENABLE_SANITIZER OR CMAKE_SYSTEM_NAME STREQUAL "iOS" OR CMAKE_SYSTEM_NAME STREQUAL "Android" OR CMAKE_SYSTEM_NAME MATCHES "Emscripten")
+    return()
+  endif()
+
+  find_program(STRIP_COMMAND NAMES strip llvm-strip)
+  if(NOT STRIP_COMMAND)
+    message(WARNING "strip command not found, target ${target} will not be stripped.")
+    return()
+  endif()
+
+  set(STRIP_FLAGS "-s")
+
+  if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
+    set(STRIP_FLAGS "-x")
+  endif()
+
+  get_property(target_type TARGET ${target} PROPERTY TYPE)
+
+  if(NOT (target_type STREQUAL "EXECUTABLE" OR target_type STREQUAL "SHARED_LIBRARY"))
+    return()
+  endif()
+
+  set(TARGET_FILE "$<TARGET_FILE:${target}>")
+
+  add_custom_command(TARGET ${target} POST_BUILD
+    COMMAND "${STRIP_COMMAND}" ${STRIP_FLAGS} "${TARGET_FILE}"
+    COMMAND_EXPAND_LISTS
+    COMMENT "Stripping ${target}"
+    VERBATIM
+  )
+
+  message(STATUS "Will strip ${target} using ${STRIP_COMMAND} ${STRIP_FLAGS}")
+endfunction()
+
+##########################################
+
+macro(sogen_assign_source_group)
+  source_group(TREE ${CMAKE_CURRENT_SOURCE_DIR} FILES ${ARGN})
+endmacro()
+
+##########################################
+
+function(sogen_target_enable_clang_tidy target)
+  if(NOT SOGEN_ENABLE_CLANG_TIDY)
+    return()
+  endif()
+
+  if(NOT CLANG_TIDY_EXECUTABLE)
+    set(_clang_tidy_hints)
+
+    if(WIN32)
+      list(APPEND _clang_tidy_hints
+        "$ENV{ProgramFiles}/LLVM/bin"
+        "C:/Program Files/LLVM/bin"
+      )
+    endif()
+
+    find_program(CLANG_TIDY_EXECUTABLE
+    NAMES clang-tidy clang-tidy.exe
+    HINTS
+      "$ENV{ProgramFiles}/LLVM/bin"
+      "C:/Program Files/LLVM/bin"
+    )
+    set(CLANG_TIDY_EXECUTABLE "${CLANG_TIDY_EXECUTABLE}" CACHE FILEPATH "Path to clang-tidy")
+  endif()
+
+  if(NOT CLANG_TIDY_EXECUTABLE)
+    message(WARNING
+      "SOGEN_ENABLE_CLANG_TIDY is ON, but clang-tidy was not found. "
+      "Add it to PATH or set CLANG_TIDY_EXECUTABLE manually."
+    )
+    return()
+  endif()
+
+  set(CLANG_TIDY_COMMAND_C
+    "${CLANG_TIDY_EXECUTABLE};--use-color;--config-file=${CMAKE_CURRENT_SOURCE_DIR}/.clang-tidy"
+  )
+  set(CLANG_TIDY_COMMAND_CXX "${CLANG_TIDY_COMMAND_C}")
+
+  if(MSVC)
+    set(CLANG_TIDY_COMMAND_CXX
+      "${CLANG_TIDY_COMMAND_CXX};--extra-arg=/EHa"
+    )
+  endif()
+
+  set_target_properties(${target} PROPERTIES
+    C_CLANG_TIDY   "${CLANG_TIDY_COMMAND_C}"
+    CXX_CLANG_TIDY "${CLANG_TIDY_COMMAND_CXX}"
+  )
+endfunction()
+
+##########################################
+
+function(sogen_targets_enable_clang_tidy)
+  foreach(target ${ARGV})
+    sogen_target_enable_clang_tidy(${target})
+  endforeach()
+endfunction()

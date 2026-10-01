@@ -1,0 +1,238 @@
+#pragma once
+
+#include <map>
+#include <memory>
+#include <string_view>
+#include <arch_emulator.hpp>
+#include <serialization.hpp>
+
+#include "emulator_utils.hpp"
+#include "handles.hpp"
+
+namespace sogen
+{
+
+    class windows_emulator;
+    struct process_context;
+    struct vcpu_context;
+    class emulator_thread;
+
+    struct io_device_context
+    {
+        handle event{};
+        emulator_pointer /*PIO_APC_ROUTINE*/ apc_routine{};
+        emulator_pointer apc_context{};
+        emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block;
+        emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu32>>> wow64_io_status_block;
+        ULONG io_control_code{};
+        emulator_pointer input_buffer{};
+        ULONG input_buffer_length{};
+        emulator_pointer output_buffer{};
+        ULONG output_buffer_length{};
+
+        // The vCPU whose thread issued this I/O request. Set on syscall-originated ioctls;
+        // null (and not serialized) for deserialized delayed ioctls re-executed from the
+        // scheduler's device pump, which must not depend on an issuing thread.
+        vcpu_context* vcpu{};
+
+        emulator_thread& thread() const;
+
+        io_device_context(memory_interface& emu)
+            : io_status_block(emu),
+              wow64_io_status_block(emu)
+        {
+        }
+
+        io_device_context(utils::buffer_deserializer& buffer)
+            : io_device_context(buffer.read<x64_emulator_wrapper>().get())
+        {
+        }
+
+        void serialize(utils::buffer_serializer& buffer) const
+        {
+            buffer.write(event);
+            buffer.write(apc_routine);
+            buffer.write(apc_context);
+            buffer.write(io_status_block);
+            buffer.write(wow64_io_status_block);
+            buffer.write(io_control_code);
+            buffer.write(input_buffer);
+            buffer.write(input_buffer_length);
+            buffer.write(output_buffer);
+            buffer.write(output_buffer_length);
+        }
+
+        void deserialize(utils::buffer_deserializer& buffer)
+        {
+            buffer.read(event);
+            buffer.read(apc_routine);
+            buffer.read(apc_context);
+            buffer.read(io_status_block);
+            buffer.read(wow64_io_status_block);
+            buffer.read(io_control_code);
+            buffer.read(input_buffer);
+            buffer.read(input_buffer_length);
+            buffer.read(output_buffer);
+            buffer.read(output_buffer_length);
+        }
+    };
+
+    struct io_device_creation_data
+    {
+        uint64_t buffer;
+        uint32_t length;
+    };
+
+    inline NTSTATUS write_io_status(const emulator_object<IO_STATUS_BLOCK<EmulatorTraits<Emu64>>> io_status_block, const NTSTATUS status,
+                                    const bool clear_struct = false)
+    {
+        io_status_block.access([=](IO_STATUS_BLOCK<EmulatorTraits<Emu64>>& status_block) {
+            if (clear_struct)
+            {
+                status_block = {};
+            }
+
+            status_block.Status = status;
+        });
+
+        return status;
+    }
+
+    inline NTSTATUS write_io_status(const io_device_context& context, const NTSTATUS status, const bool clear_struct = false)
+    {
+        const auto result = write_io_status(context.io_status_block, status, clear_struct);
+        if (context.io_status_block && context.wow64_io_status_block)
+        {
+            const auto native_status = context.io_status_block.read();
+            context.wow64_io_status_block.access([&](IO_STATUS_BLOCK<EmulatorTraits<Emu32>>& status_block) {
+                status_block.Status = native_status.Status;
+                status_block.Information = static_cast<EmulatorTraits<Emu32>::ULONG_PTR>(native_status.Information);
+            });
+        }
+
+        return result;
+    }
+
+    struct io_device : ref_counted_object
+    {
+        io_device() = default;
+        ~io_device() override = default;
+
+        io_device(io_device&&) = default;
+        io_device& operator=(io_device&&) = default;
+
+        io_device(const io_device&) = delete;
+        io_device& operator=(const io_device&) = delete;
+
+        virtual NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) = 0;
+
+        virtual void create(windows_emulator& win_emu, const io_device_creation_data& data)
+        {
+            (void)win_emu;
+            (void)data;
+        }
+
+        virtual void work(windows_emulator& win_emu)
+        {
+            (void)win_emu;
+        }
+
+        NTSTATUS execute_ioctl(windows_emulator& win_emu, const io_device_context& c);
+    };
+
+    struct stateless_device : io_device
+    {
+        void create(windows_emulator&, const io_device_creation_data&) final
+        {
+        }
+
+        void serialize_object(utils::buffer_serializer&) const override
+        {
+        }
+
+        void deserialize_object(utils::buffer_deserializer&) override
+        {
+        }
+    };
+
+    bool needs_32_bit_devices(const windows_emulator& win_emu);
+
+    // Everything a device factory needs to construct its device. Only the WoW64 flag for now; grows as
+    // more construction-time context is required, without touching every factory signature again.
+    struct device_creation_context
+    {
+        bool is_32_bit{};
+    };
+
+    using device_factory = std::unique_ptr<io_device> (*)(const device_creation_context& context);
+
+    std::unique_ptr<io_device> create_device(std::u16string_view device, const device_creation_context& context);
+
+    // Single source of truth for the emulator's IO devices: NT device name -> factory. Several names may
+    // map to the same factory (e.g. the transport stub serves Tcp/Tcp6/Udp/RawIp). create_device() looks a
+    // name up here, and consumers that need every device type (e.g. the handler fuzzer) enumerate it and
+    // dedupe by factory, so a newly added device is visible everywhere without a second list to update.
+    // Ordered so the fuzzer's enumeration is deterministic across runs.
+    const std::map<std::u16string_view, device_factory>& get_device_registry();
+
+    class io_device_container : public io_device
+    {
+      public:
+        io_device_container() = default;
+
+        io_device_container(std::u16string device, windows_emulator& win_emu, const io_device_creation_data& data)
+            : is_32_bit_(needs_32_bit_devices(win_emu)),
+              device_name_(std::move(device))
+        {
+            this->setup();
+            this->device_->create(win_emu, data);
+        }
+
+        void work(windows_emulator& win_emu) override;
+        NTSTATUS io_control(windows_emulator& win_emu, const io_device_context& context) override;
+
+        void serialize_object(utils::buffer_serializer& buffer) const override;
+        void deserialize_object(utils::buffer_deserializer& buffer) override;
+
+        template <typename T = io_device>
+            requires(std::is_base_of_v<io_device, T> || std::is_same_v<io_device, T>)
+        T* get_internal_device() const
+        {
+            this->assert_validity();
+            auto* value = this->device_.get();
+            return dynamic_cast<T*>(value);
+        }
+
+        std::u16string_view get_device_name() const
+        {
+            this->assert_validity();
+            return this->device_name_;
+        }
+
+        std::u16string get_device_path() const
+        {
+            this->assert_validity();
+            return u"\\Device\\" + this->device_name_;
+        }
+
+      private:
+        bool is_32_bit_{};
+        std::u16string device_name_{};
+        std::unique_ptr<io_device> device_{};
+
+        void setup()
+        {
+            const device_creation_context context{.is_32_bit = this->is_32_bit_};
+            this->device_ = create_device(this->device_name_, context);
+        }
+
+        void assert_validity() const
+        {
+            if (!this->device_)
+            {
+                throw std::runtime_error("Device not created!");
+            }
+        }
+    };
+
+} // namespace sogen

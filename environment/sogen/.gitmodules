@@ -1,0 +1,61 @@
+[submodule "deps/unicorn"]
+	path = deps/unicorn
+	url = https://github.com/momo5502/unicorn.git
+	shallow = true
+	branch = dev
+[submodule "deps/reflect"]
+	path = deps/reflect
+	url = https://github.com/qlibs/reflect.git
+	shallow = true
+[submodule "deps/googletest"]
+	path = deps/googletest
+	url = https://github.com/google/googletest.git
+	shallow = true
+[submodule "deps/gtest-parallel"]
+	path = deps/gtest-parallel
+	url = https://github.com/google/gtest-parallel.git
+	shallow = true
+[submodule "deps/flatbuffers"]
+	path = deps/flatbuffers
+	url = https://github.com/google/flatbuffers.git
+	shallow = true
+[submodule "deps/base64"]
+	path = deps/base64
+	url = https://github.com/tobiaslocker/base64.git
+	shallow = true
+[submodule "deps/minidump_cpp"]
+	path = deps/minidump_cpp
+	url = https://github.com/redthing1/minidump_cpp
+	shallow = true
+[submodule "deps/capstone"]
+	path = deps/capstone
+	url = https://github.com/capstone-engine/capstone.git
+	shallow = true
+[submodule "deps/zstd"]
+	path = deps/zstd
+	url = https://github.com/facebook/zstd.git
+	shallow = true
+[submodule "deps/nanobind"]
+	path = deps/nanobind
+	url = https://github.com/wjakob/nanobind.git
+	shallow = true
+[submodule "deps/sogen-linux-files"]
+	path = deps/sogen-linux-files
+	url = https://github.com/momo5502/sogen-linux-files.git
+	shallow = true
+[submodule "deps/SDL"]
+	path = deps/SDL
+	url = https://github.com/libsdl-org/SDL.git
+[submodule "deps/Vulkan-Headers"]
+	path = deps/Vulkan-Headers
+	url = https://github.com/KhronosGroup/Vulkan-Headers.git
+	shallow = true
+[submodule "deps/CLI11"]
+	path = deps/CLI11
+	url = https://github.com/CLIUtils/CLI11.git
+	shallow = true
+[submodule "deps/FEX"]
+	path = deps/FEX
+	url = https://github.com/momo5502/FEX.git
+	shallow = true
+    branch = macos-arm64
