@@ -1,0 +1,7 @@
+# Local analysis/runtime artifacts
+.venv-sogen/
+tools/sogen/root/
+# Upstream checkout is provisioned by setup_sogen.sh and is intentionally not vendored.
+tools/sogen/
+sogen-trace.jsonl
+__pycache__/
