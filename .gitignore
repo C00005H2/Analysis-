@@ -1,5 +1,6 @@
 # Local analysis/runtime artifacts
 .venv-sogen/
+.venv-tools/
 tools/sogen/root/
 # Upstream checkout is provisioned by setup_sogen.sh and is intentionally not vendored.
 tools/sogen/

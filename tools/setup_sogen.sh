@@ -12,11 +12,18 @@ else
   git -C tools/sogen submodule update --init --recursive
 fi
 
-python3 -m venv .venv-sogen
-. .venv-sogen/bin/activate
-python -m pip install --upgrade pip
-# The current upstream package is source distributed; this may compile the
-# native extension and therefore needs a C++ compiler and CMake on the host.
+python3 -m venv .venv-tools
+. .venv-tools/bin/activate
+python -m pip install --upgrade pip setuptools wheel
+# Binary wheels provide CMake/Ninja without requiring apt repositories.
+python -m pip install cmake ninja libclang
+export PATH="$ROOT_DIR/.venv-tools/bin:$PATH"
+
+python3 -m venv "$ROOT_DIR/.venv-sogen"
+. "$ROOT_DIR/.venv-sogen/bin/activate"
+python -m pip install --upgrade pip setuptools wheel
+# The current upstream package is source distributed; this compiles the native
+# extension and therefore needs the system C++ compiler and Python headers.
 python -m pip install sogen
 
 if [[ ! -d tools/sogen/root ]]; then

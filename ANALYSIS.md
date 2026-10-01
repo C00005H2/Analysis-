@@ -41,11 +41,17 @@ upstream Python API (`app.debug.set_breakpoint(address)` where available) or a
 `memory_execution_at` hook. Record register and memory observations only; do
 not rewrite instructions, return values, or input buffers.
 
-## Current environment limitation
+## Provisioning status
 
-This container has no system CMake/compiler/debugger packages and its Debian apt
-index cannot reach the mirror, so the native Sogen extension cannot be built in
-this turn. The source and reproducible setup are present; running the setup
-script on a host with CMake, Ninja, a C++ compiler, and network access completes
-installation. The PE files are Windows x64/Win32 binaries and are not run with
-Wine or native Linux tools here.
+CMake 4.4.3 and Ninja 1.13.2 were downloaded as Python wheels into the local
+`.venv-tools` environment. GCC/G++ and GNU make are already available in the
+container. Python build tooling (`pip`, `setuptools`, `wheel`, `nanobind`, and
+`libclang`) is also provisioned there.
+
+The Sogen build reached native compilation, but the container does not have the
+system Python development headers. I downloaded and configured CPython 3.11
+sources as a temporary header workaround; the vendored Unicorn build then hit an
+upstream portability compile error. The Sogen root URL is reachable by DNS but
+TLS egress to `sogen.dev` is blocked in this sandbox, so `root.zip` could not be
+downloaded. `tools/setup_sogen.sh` now performs all of these downloads when run
+in an environment with working TLS and Python development headers.
