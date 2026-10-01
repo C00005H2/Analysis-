@@ -55,3 +55,17 @@ upstream portability compile error. The Sogen root URL is reachable by DNS but
 TLS egress to `sogen.dev` is blocked in this sandbox, so `root.zip` could not be
 downloaded. `tools/setup_sogen.sh` now performs all of these downloads when run
 in an environment with working TLS and Python development headers.
+
+## Downloadable environment archives
+
+The locally provisioned assets are also stored in the repository under `assets/`:
+
+```bash
+xz -dc assets/analysis-assets-sogen.tar.xz | tar -xf -
+xz -dc assets/analysis-assets-python-tools.tar.xz | tar -xf -
+xz -dc assets/analysis-assets-cpython.tar.xz | tar -xf -
+```
+
+These are compressed archives of the Sogen checkout, Python tools environment,
+and temporary CPython source tree. SHA-256 checksums are recorded in the commit
+history and can be generated with `sha256sum assets/*.xz`.
