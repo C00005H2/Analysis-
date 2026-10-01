@@ -1,0 +1,5 @@
+# Local Qiling environment and downloaded root filesystem
+.venv/
+qiling-rootfs/
+qiling-test-report.txt
+__pycache__/
